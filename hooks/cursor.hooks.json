@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeSubmitPrompt": [
+      {
+        "command": "python \"D:\\code\\yunxiao\\zhishu\\memory-mcp\\tools\\capture_hook.py\" --source cursor"
+      }
+    ],
+    "afterAgentResponse": [
+      {
+        "command": "python \"D:\\code\\yunxiao\\zhishu\\memory-mcp\\tools\\capture_hook.py\" --source cursor"
+      }
+    ]
+  }
+}

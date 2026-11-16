@@ -1,0 +1,297 @@
+diff --git a/memory-mcp/app/service.py b/memory-mcp/app/service.py
+index 6eaf62a..9e28242 100644
+--- a/memory-mcp/app/service.py
++++ b/memory-mcp/app/service.py
+@@ -52,6 +52,90 @@ def _snippet(text: str, size: int = 320) -> str:
+     return clean[:size]
+ 
+ 
++_TERM_SPLIT = re.compile(r"[\s,，。;；、/|]+")
++_MAX_TERMS = 8
++
++
++def _terms(q: str) -> list[str]:
++    """检索词：中文没有空格，靠空白/标点切；切不出来就整串当一个词。"""
++    return [t for t in _TERM_SPLIT.split(q.strip()) if t.strip()][:_MAX_TERMS]
++
++
++def _personal_score_and_match(body_expr: str, n_terms: int, op: str) -> tuple[str, str]:
++    """生成 mem.doc / mem.conv 共用的排序表达式与过滤条件。
++
++    过滤：每个词都要命中（op='and'，与词序无关）；op='or' 是兜底放宽。
++    排序：标题全词命中 > 词覆盖度（word_similarity） > 命中密度 > 整串相似度。
++    """
++    joiner = " and " if op == "and" else " or "
++    in_title = [f"title ilike %(p{i})s" for i in range(n_terms)]
++    match = joiner.join(
++        f"(title ilike %(p{i})s or {body_expr} ilike %(p{i})s)" for i in range(n_terms)
++    )
++    w_title = [f"word_similarity(lower(%(t{i})s), lower(title))" for i in range(n_terms)]
++    w_body = [f"word_similarity(lower(%(t{i})s), lower({body_expr}))" for i in range(n_terms)]
++    density = [
++        f"(length(lower({body_expr}))"
++        f" - length(replace(lower({body_expr}), lower(%(t{i})s), '')))::float"
++        f" / greatest(length(%(t{i})s), 1) / greatest(length({body_expr}), 1)"
++        for i in range(n_terms)
++    ]
++    score = (
++        f"(case when {' and '.join(in_title)} then 0.6 else 0 end)"
++        f" + ({' + '.join(w_title)}) / {n_terms}.0"
++        f" + ({' + '.join(w_body)}) / {n_terms}.0 * 0.5"
++        f" + ({' + '.join(density)}) / {n_terms}.0 * 100.0"
++        " + similarity(lower(title), lower(%(q)s)) * 0.3"
++    )
++    return score, match
++
++
++def _personal_rows(
++    cur, params: dict[str, Any], n_terms: int, limit: int, op: str
++) -> list[dict[str, Any]]:
++    score_doc, match_doc = _personal_score_and_match("body", n_terms, op)
++    score_conv, match_conv = _personal_score_and_match("coalesce(snippet, '')", n_terms, op)
++    rows: list[dict[str, Any]] = []
++    cur.execute(
++        f"""select path, kind, title, body, updated_at, {score_doc} as score
++            from mem.doc
++            where user_id = %(uid)s and ({match_doc})
++            order by score desc, updated_at desc limit %(lim)s""",
++        params,
++    )
++    for row in cur.fetchall():
++        rows.append({
++            "scope": "personal",
++            "source": "mem.doc",
++            "kind": row[1],
++            "id": row[0],
++            "title": row[2] or "",
++            "snippet": _snippet(row[3]),
++            "date": row[4].isoformat() if row[4] else None,
++            "score": round(float(row[5]), 4),
++        })
++    cur.execute(
++        f"""select id, source, title, snippet, updated_at, {score_conv} as score
++            from mem.conv
++            where user_id = %(uid)s and ({match_conv})
++            order by score desc, updated_at desc limit %(lim)s""",
++        params,
++    )
++    for row in cur.fetchall():
++        rows.append({
++            "scope": "personal",
++            "source": "mem.conv",
++            "kind": "conversation",
++            "id": row[0],
++            "title": row[2] or row[1],
++            "snippet": _snippet(row[3] or ""),
++            "date": row[4].isoformat() if row[4] else None,
++            "score": round(float(row[5]), 4),
++        })
++    rows.sort(key=lambda x: (x.get("score") or 0.0, x.get("date") or ""), reverse=True)
++    return rows[:limit]
++
++
+ def search_public(query: str, limit: int = 10) -> list[dict[str, Any]]:
+     q = (query or "").strip()
+     if not q:
+@@ -83,50 +167,25 @@ def search_public(query: str, limit: int = 10) -> list[dict[str, Any]]:
+ 
+ 
+ def search_personal(query: str, user_id: str, limit: int = 10) -> list[dict[str, Any]]:
++    """个人检索：多词 AND（词序无关）+ pg_trgm 排序，全词无果时退一步任一命中。
++
++    user_id 过滤是 SQL 硬条件，检索结果不会跨用户（隔离用例见 tests/test_search_isolation.py）。
++    """
+     q = (query or "").strip()
+     if not q:
+         return []
+     limit = max(1, min(limit, 50))
+-    pat = _like(q)
+-    out: list[dict[str, Any]] = []
++    terms = _terms(q) or [q]
++    params: dict[str, Any] = {"uid": user_id, "lim": limit, "q": q}
++    for i, term in enumerate(terms):
++        params[f"p{i}"] = _like(term)
++        params[f"t{i}"] = term
+     with _conn(MEM_DSN) as c:
+         with c.cursor() as cur:
+-            cur.execute(
+-                """select path, kind, title, body, updated_at
+-                   from mem.doc
+-                   where user_id = %s and (title ilike %s or body ilike %s)
+-                   order by updated_at desc limit %s""",
+-                (user_id, pat, pat, limit),
+-            )
+-            for row in cur.fetchall():
+-                out.append({
+-                    "scope": "personal",
+-                    "source": "mem.doc",
+-                    "kind": row[1],
+-                    "id": row[0],
+-                    "title": row[2] or "",
+-                    "snippet": _snippet(row[3]),
+-                    "date": row[4].isoformat() if row[4] else None,
+-                })
+-            cur.execute(
+-                """select id, source, title, snippet, updated_at
+-                   from mem.conv
+-                   where user_id = %s and (title ilike %s or snippet ilike %s)
+-                   order by updated_at desc limit %s""",
+-                (user_id, pat, pat, limit),
+-            )
+-            for row in cur.fetchall():
+-                out.append({
+-                    "scope": "personal",
+-                    "source": "mem.conv",
+-                    "kind": "conversation",
+-                    "id": row[0],
+-                    "title": row[2] or row[1],
+-                    "snippet": _snippet(row[3] or ""),
+-                    "date": row[4].isoformat() if row[4] else None,
+-                })
+-    out.sort(key=lambda x: x.get("date") or "", reverse=True)
+-    return out[:limit]
++            out = _personal_rows(cur, params, len(terms), limit, "and")
++            if not out and len(terms) > 1:
++                out = _personal_rows(cur, params, len(terms), limit, "or")
++    return out
+ 
+ 
+ def search(query: str, user_id: str, limit: int = 10, scope: str = "auto") -> dict[str, Any]:
+@@ -1010,6 +1069,113 @@ def _gate_elapsed_ms(t0: float) -> int:
+     return int(round((time.monotonic() - t0) * 1000))
+ 
+ 
++# ---- gate 召回：分层 / 配额 / 权重（2026-11-15） ----
++# 问题：state/* 全量状态文件与两个会话摘要吃掉 52% 的注入位，
++#       新写的 cloud/owner 摘要进不了 top3。
++# 做法：① 分层——state/* 默认不进 gate 召回，query 明确命中其标题词才放 1 条；
++#       ② 配额——每轮注入 doc ≤2、conv ≤1；
++#       ③ 权重——排序 = trigram 分 × kind 权重（decision/artifact > event）× 时间衰减。
++
++_STATE_PATH_PREFIXES = ("state/", "INDEX.md")
++_KIND_WEIGHT = {
++    "decision": 1.40,
++    "artifact": 1.25,
++    "metric": 1.15,
++    "entity": 1.05,
++    "event": 1.00,
++    "conversation": 0.90,
++}
++_RECALL_DECAY_HALF_LIFE_DAYS = 14.0
++_RECALL_DECAY_FLOOR = 0.6
++_GATE_DOC_QUOTA = 2
++_GATE_CONV_QUOTA = 1
++_GATE_CANDIDATES_PER_TERM = 12
++
++
++def _is_state_doc(r: dict) -> bool:
++    return r.get("source") == "mem.doc" and str(r.get("id") or "").startswith(_STATE_PATH_PREFIXES)
++
++
++def _title_hit(r: dict, query: str) -> bool:
++    """标题的 3 字窗口出现在 query 里，才算「query 明确命中标题词」。"""
++    title = (r.get("title") or "").strip().lower()
++    ql = (query or "").lower()
++    if not title or not ql:
++        return False
++    if title in ql:
++        return True
++    return any(title[i:i + 3] in ql for i in range(max(0, len(title) - 2)))
++
++
++def _recall_decay(r: dict, now: datetime) -> float:
++    raw = r.get("date") or ""
++    try:
++        ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
++        age_days = max(0.0, (now - ts).total_seconds() / 86400.0)
++    except Exception:
++        return _RECALL_DECAY_FLOOR
++    return _RECALL_DECAY_FLOOR + (1.0 - _RECALL_DECAY_FLOOR) * (
++        0.5 ** (age_days / _RECALL_DECAY_HALF_LIFE_DAYS)
++    )
++
++
++def _recall_score(r: dict, now: datetime) -> float:
++    base = float(r.get("score") or 0.0)
++    return base * _KIND_WEIGHT.get(str(r.get("kind") or ""), 1.0) * _recall_decay(r, now)
++
++
++def select_recall(query: str, user_id: str, limit: int = 5,
++                  conversation_id: str = "") -> list[dict]:
++    """gate 的召回选择：宽召回（每个检索词各查一次）→ 分层 → 加权 → 配额。"""
++    q = (query or "").strip()
++    if not q:
++        return []
++    limit = max(1, min(int(limit), 10))
++    terms = [t for t in re.split(r"[\s,，。;；、/|]+", q) if len(t) >= 2][:4]
++    seen: dict[tuple, dict] = {}
++    for term in [q, *terms]:
++        for r in search_personal(term, user_id, _GATE_CANDIDATES_PER_TERM):
++            key = (r.get("source"), r.get("id"))
++            if conversation_id and r.get("id") == conversation_id:
++                continue
++            snippet = (r.get("snippet") or "").lstrip()
++            if snippet.startswith("You are the ") or snippet.startswith("You are a "):
++                continue
++            prev = seen.get(key)
++            if prev is None or float(r.get("score") or 0) > float(prev.get("score") or 0):
++                seen[key] = r
++
++    now = datetime.now(timezone.utc)
++    ranked: list[dict] = []
++    for r in seen.values():
++        item = dict(r)
++        item["recall_score"] = round(_recall_score(item, now), 6)
++        ranked.append(item)
++    ranked.sort(key=lambda r: r["recall_score"], reverse=True)
++
++    state_hits = [r for r in ranked if _is_state_doc(r) and _title_hit(r, q)]
++    normal = [r for r in ranked if not _is_state_doc(r)]
++
++    picked: list[dict] = []
++    n_doc = n_conv = 0
++    for r in normal:
++        if r.get("source") == "mem.doc":
++            if n_doc >= _GATE_DOC_QUOTA:
++                continue
++            n_doc += 1
++        else:
++            if n_conv >= _GATE_CONV_QUOTA:
++                continue
++            n_conv += 1
++        picked.append(r)
++        if len(picked) >= limit:
++            return picked
++    # 状态文件是最后手段：只在 query 明确命中标题词时补 1 条（不进 top3 的前两位）
++    if state_hits and len(picked) < limit:
++        picked.append(state_hits[0])
++    return picked
++
++
+ def _gate_log(user_id: str, source: str, conversation_id: str, turn: int | None,
+               query: str, merged: list[dict], injected_chars: int, latency_ms: int,
+               ok: bool = True, error: str = "") -> None:
+@@ -1052,22 +1218,7 @@ def gate(query: str, user_id: str, source: str = "gate", conversation_id: str =
+         if conversation_id:
+             event = ingest_event(source, conversation_id, role, q, title="", meta={"gate": True})
+             trace = event.get("event_id")
+-        terms = [t for t in re.split(r"[\s,??;?/]+", q) if len(t) >= 2][:4]
+-        seen: set[tuple] = set()
+-        for term in [q, *terms]:
+-            for r in search(term, user_id, limit, "personal")["results"]:
+-                key = (r.get("scope"), r.get("id"))
+-                if key in seen:
+-                    continue
+-                if conversation_id and r.get("id") == conversation_id:
+-                    continue
+-                snippet = (r.get("snippet") or "").lstrip()
+-                if snippet.startswith("You are the ") or snippet.startswith("You are a "):
+-                    continue
+-                seen.add(key)
+-                merged.append(r)
+-        merged.sort(key=lambda r: 0 if r.get("source") == "mem.doc" else 1)
+-        merged = merged[:limit]
++        merged = select_recall(q, user_id, limit, conversation_id)
+         lines = ["## ???????", "???????????????????????????"]
+         for i, r in enumerate(merged, 1):
+             title = (r.get("title") or "").strip()

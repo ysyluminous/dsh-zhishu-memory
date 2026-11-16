@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"D:\\code\\yunxiao\\zhishu\\memory-mcp\\tools\\capture_hook.py\" --source codex --gate",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"D:\\code\\yunxiao\\zhishu\\memory-mcp\\tools\\capture_hook.py\" --source codex",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

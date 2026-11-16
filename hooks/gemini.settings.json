@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "BeforeAgent": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "name": "capture-user",
+            "type": "command",
+            "command": "python \"D:\\code\\yunxiao\\zhishu\\memory-mcp\\tools\\capture_hook.py\" --source gemini-cli --gate"
+          }
+        ]
+      }
+    ],
+    "AfterAgent": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "name": "capture-assistant",
+            "type": "command",
+            "command": "python \"D:\\code\\yunxiao\\zhishu\\memory-mcp\\tools\\capture_hook.py\" --source gemini-cli"
+          }
+        ]
+      }
+    ]
+  }
+}

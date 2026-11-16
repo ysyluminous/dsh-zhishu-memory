@@ -1,0 +1,45 @@
+# 密钥与本地配置（绝不入库）
+.env
+.env.*
+!.env.example
+*.env.bak*
+*.bak
+*.bak-*
+secrets/
+*.pem
+*.key
+
+# 运行时产物
+*.log
+logs/
+uvicorn-*.log
+restart-*.log
+*.pid
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+
+# 本地备份/快照（历史里有教训：备份目录混进过仓库）
+backup-*/
+backup-*
+*-backup-*/
+patches/*.patch.bak*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

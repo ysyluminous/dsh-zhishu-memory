@@ -1,0 +1,4 @@
+fastmcp>=4.1
+psycopg[binary]>=3.2
+uvicorn>=0.30
+python-dotenv>=1.0
