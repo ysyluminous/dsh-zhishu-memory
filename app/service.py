@@ -258,7 +258,7 @@ def _idf_weights(
         hit = _DF.get(key)
         if hit and now - float(hit.get("ts", 0)) <= _DF_TTL:
             df = _safe_df(hit.get("df", 1))
-            weights[i] = 1.0 / (1.0 + math.log(max(1.0, df))) if df >= 3 else 1e-6
+            weights[i] = _df_weight(df)
         else:
             missing.append(i)
     if missing:
@@ -269,8 +269,7 @@ def _idf_weights(
         cur.execute(f"select {exprs} from mem.doc where user_id = %(uid)s", params)
         for i, df in zip(missing, cur.fetchone()):
             df = _safe_df(df)
-            # df<3 的 gram 基本是切词噪声（么解/决的），不参与覆盖度门槛，但仍可命中。
-            weights[i] = 1.0 / (1.0 + math.log(df)) if df >= 3 else 1e-6
+            weights[i] = _df_weight(df)
             _DF[f"{user_id}:{params[f't{i}']}"] = {"df": df, "ts": now}
         _df_cache_save()
     return weights
@@ -1963,6 +1962,18 @@ def _recall_decay(r: dict, now: datetime) -> float:
     )
 
 
+def _df_weight(df: float) -> float:
+    """IDF 权重：df 越小越重，但**不再把稀有词清零**。
+
+    旧写法对 df<3 给 1e-6：本意是丢掉「么解/决的」这类切词噪声，实际却把
+    **最有区分度的词**（路径、标识符、插件名、错误串）一起清零了——2026-11-19
+    排查「自动注入完全没关系」时实测：查询里 `df=1` 的词权重 1e-6，只剩
+    「内容/自动/注入」这类高频词在决定召回，于是召回的全是无关会话/文档。
+    现在按标准 IDF 平滑：df=1 → 1.0，df=2 → 0.59，df=100 → 0.18。
+    """
+    return 1.0 / (1.0 + math.log(max(1.0, float(df))))
+
+
 def _recall_score(r: dict, now: datetime) -> float:
     base = float(r.get("score") or 0.0)
     return base * _KIND_WEIGHT.get(str(r.get("kind") or ""), 1.0) * _recall_decay(r, now)
@@ -1973,6 +1984,10 @@ def select_recall(query: str, user_id: str, limit: int = 5,
     """gate 的召回选择：宽召回（每个检索词各查一次）→ 分层 → 加权 → 配额。"""
     q = (query or "").strip()
     if not q:
+        return []
+    # 太短/太泛的输入（「继续」「好的」）没有检索价值：以前它会命中一条高分长文，
+    # 然后被塞进注入 → 用户看到的就是一条毫不相干的记录。宁可这轮不注入。
+    if len(re.sub(r"\s+", "", q)) < 6:
         return []
     limit = max(1, min(int(limit), 10))
     terms = [t for t in re.split(r"[\s,，。;；、/|]+", q) if len(t) >= 2][:4]
@@ -1996,6 +2011,22 @@ def select_recall(query: str, user_id: str, limit: int = 5,
         item["recall_score"] = round(_recall_score(item, now), 6)
         ranked.append(item)
     ranked.sort(key=lambda r: r["recall_score"], reverse=True)
+
+    # 相关度下限（2026-11-19 加）：以前不管分数多低都塞满 3 条，于是 0.3 分的
+    # 无关会话也进注入，用户看到的就是「完全没关系」。现在按「绝对下限 + 相对最佳
+    # 分数的比例」双重过滤：一条都不够就返回空，让 gate 输出「本轮没有相关记忆」。
+    if ranked:
+        try:
+            abs_floor = float(os.getenv("MEM_GATE_MIN_SCORE", "2.0") or 2.0)
+        except (TypeError, ValueError):
+            abs_floor = 2.0
+        try:
+            ratio = float(os.getenv("MEM_GATE_MIN_RATIO", "0.22") or 0.22)
+        except (TypeError, ValueError):
+            ratio = 0.22
+        best = float(ranked[0]["recall_score"])
+        floor = max(abs_floor, best * ratio)
+        ranked = [r for r in ranked if float(r["recall_score"]) >= floor]
 
     state_hits = [r for r in ranked if _is_state_doc(r) and _title_hit(r, q)]
     normal = [r for r in ranked if not _is_state_doc(r)]
