@@ -43,3 +43,9 @@ venv/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ??????2026-11-19 ???
+watch-restart-*.exit.txt
+app/.cache/
+_app-backup-*/
+
