@@ -8,6 +8,8 @@
 
 ### 加
 
+- **发布：`ysyluminous/dsh-zhishu-memory` 已建仓并公开**（2026-11-19）：之前远端只有地址、没有仓库，`git push` 一直 `Repository not found`（其实是私有/不存在，不是网络）。现在仓库已创建（public）、`main` 已推上去，匿名 `git ls-remote` 能列出 `refs/heads/main` —— 「别人一键安装 → 拉到含本版服务的仓库 → 自动启动」这条链路成立。
+- **服务连接参数搬进面板，`.env` 退役**：`memDsn` / `zhishuDsn` / `memDataDir` / `memReviewToken` / `memDefaultUser` / `memRequireKey` / `memDbLabel` / `memEnv` 八项进「配置」页（`group: 'service'`），写 `settings.json`，可看可改可随文件一起备份；mem-float 启动服务时把它们翻译成环境变量，服务端 `config.py` 也会回落到面板文件，所以 `.env` 删掉也照常连库（`.env` 现在只在「脱离 DSH 单独跑服务」时才需要）。优先级：进程环境 > 面板文件 > 默认值。
 - **切换记忆服务到 `zhishu-memory`（S4）**：`memoryMcpDir` 改指 `D:\code\dsh-zhishu-memory`，服务自带 `/console`、`/keys`、`#mcp` 审计；WorkBuddy 与插件都还是 41012，一行客户端配置没改。实测 `/health`、`/console`、`/keys`、`/console/api/mcp`、`/conversations/search` 全 200，工具数 46。
 - **装上就能用（别人的体验）**：① `memoryMcpRepo` 默认指向公开仓库，新机器「一键装环境」的 memory 步开箱可用，不用先找 Git 地址；② mem-float 装载 8 秒后自动探一次——目录在、服务没跑、用户本次没手动停过，就自动拉起（只启动，不 clone、不 pip install；手动点过「停止」后不再自动起）。
 - **`zhishu-memory` 记忆引擎对齐（S3）**：把 `memory-mcp` 的引擎整块接入 `D:\code\dsh-zhishu-memory\app`（`service.py` + core/history/issues/observation/projects/quality/supersede/visibility + todo_store/growth），46 个 MCP 工具与全部 REST 路由齐活，同时保留 DSH 自己的控制台、`#mcp` 审计、上下文编排与本地模式 Key 放行；文件型存储收敛到 `config.DATA_DIR`（`MEM_DATA_DIR` 可覆盖）。同一个库 + 同一个数据目录下，`/search`、`/conversations/search`、`/stats`、`/issues` 与线上 `memory-mcp` **字节级一致**。

@@ -55,7 +55,7 @@ DSH 插件（mem-float）
 | S3 | 引擎对齐（**已完成 2026-11-19**） | 把 `memory-mcp` 的引擎整块接进 `zhishu-memory`：`service.py` + `core/history/issues/observation/projects/quality/supersede/visibility/todo_store/growth_*` + `mcp_server.py`（46 个工具、全部 REST 路由），再重新挂回 DSH 自己的 `McpAuditMiddleware` / `register_console` / `register_context`，并保留本地模式 Key 放行。文件型存储收敛到 `config.DATA_DIR`（默认 `<repo>/data`，`MEM_DATA_DIR` 可指向业务仓 `data/`） | 行为与现在一致，才敢切 | 2–3d（实际 1 轮） | 中 | 见下：REST 5/5 与文件型 7/7 对齐 |
 | S4 | 切换（**已完成 2026-11-19**） | `memoryMcpDir` → `D:\code\dsh-zhishu-memory`；建 `zhishu-memory/.env`（沿用原 DSN + `MEM_DATA_DIR=D:\code\yunxiao\zhishu\data` + `MEM_DB_LABEL`）；停/起 41012；WorkBuddy 地址不变 | 单一记忆 MCP，名字与仓库一致 | 0.5d | 中 | `/console` 200、`/keys` 200、`/console/api/mcp` 200、46 工具、`/conversations/search` 200；面板 `/mcp/status`、`/mcp/keys` 都有数据 |
 | S5 | 收尾 | ① 把 `data/`（audit/observations/issues）迁进 `zhishu-memory` 并去掉 `MEM_DATA_DIR`；② 本机 `zhishu-mem-pg` 补 trgm 索引（本机库 personal 检索现在会超时）；③ `history.verify()` 的断点（第 541 行）由账号主定怎么修；④ 备份/回滚演练 | 可持续维护 | 1–2d | 低 | `tools/verify.mjs` 全绿；回滚演练一次；本机库检索 <1s |
-| S6 | 发布（让“别人装了就能用”） | 把今天这些改动提交 + 推到 `ysyluminous/dsh-zhishu-memory`（含 `dsh-plugin/`，它目前还是 untracked）；确认一键安装默认 Git 地址能拉到含本版服务的仓库 | 别人装插件 → 一键安装 → 自动启动 | 0.5d | 低 | 全新 profile/新机器上：装插件 → 一键装环境 → 胶囊绿灯、MCP 页可用 |
+| S6 | 发布（**已完成 2026-11-19**） | 建公开仓库 `ysyluminous/dsh-zhishu-memory`（此前不存在），推 `main`（`4dfb9df`），并做**匿名** `ls-remote` 复验 | 别人装插件 → 一键安装 → 自动启动 | 0.5d | 低 | 匿名 `git ls-remote` 能列出 `refs/heads/main`；面板默认 `memoryMcpRepo` 指向它 |
 
 ### 为什么是这个顺序
 
