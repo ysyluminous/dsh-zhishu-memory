@@ -173,6 +173,36 @@ export function apply(ctx, config) {
   };
 
   /**
+   * 记忆服务需要的环境变量：面板设置优先，缺的才用进程环境。
+   *
+   * 为什么这样拼：服务原本靠 `.env`，但那份文件用户看不见、改起来要开编辑器、
+   * 备份也容易漏。现在统一放 `settings.json`（面板可看可改），启动时由这里
+   * 翻译成环境变量传给 python；空值不传，留给服务自己的默认值。
+   * @returns {Record<string, string>} Environment overrides for the child process.
+   */
+  const serviceEnv = () => {
+    const values = readSettings();
+    const pairs = [
+      ['memDsn', 'MEM_DSN'],
+      ['zhishuDsn', 'ZHISHU_DSN'],
+      ['memDataDir', 'MEM_DATA_DIR'],
+      ['memReviewToken', 'MEM_REVIEW_TOKEN'],
+      ['memDefaultUser', 'MEM_DEFAULT_USER'],
+      ['memDbLabel', 'MEM_DB_LABEL'],
+      ['memEnv', 'DSH_ENV'],
+    ];
+    const env = {};
+    for (const [key, name] of pairs) {
+      const value = values && values[key];
+      if (typeof value === 'string' && value.trim()) env[name] = value.trim();
+    }
+    if (values && typeof values.memRequireKey === 'boolean') {
+      env.MEM_REQUIRE_KEY = values.memRequireKey ? '1' : '0';
+    }
+    return env;
+  };
+
+  /**
    * Start the Python service detached, so closing DSH does not take it down.
    * Windows needs the `cmd /c start` wrapper: a plain detached spawn was
    * observed to fail silently here (process never appears, no error).
@@ -181,7 +211,7 @@ export function apply(ctx, config) {
    * @param {string} entry - Entry file relative to `dir`.
    */
   const spawnService = (python, dir, entry) => {
-    const env = { ...process.env, PORT: String(cfg.servicePort) };
+    const env = { ...process.env, ...serviceEnv(), PORT: String(cfg.servicePort) };
     if (process.platform === 'win32') {
       const child = spawn('cmd.exe', ['/c', 'start', '""', '/b', python, entry], {
         cwd: dir, env, stdio: 'ignore', windowsHide: true,

@@ -10,7 +10,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from . import service
-from .config import DEFAULT_USER, REQUIRE_KEY, SERVICE_ENV, DB_LABEL
+from .config import DEFAULT_USER, REQUIRE_KEY, REVIEW_TOKEN, SERVICE_ENV, DB_LABEL
 from . import growth_log as growth
 from . import keys as keys_svc
 
@@ -129,7 +129,8 @@ def search(query: str, limit: int = 10, scope: str = "auto", include_pending: bo
 @mcp.tool
 def remember(text: str, kind: str = "event", title: str = "", topics: str = "",
              source: str = "", anchor: str = "", supersedes: str = "",
-             force_new: bool = False) -> dict[str, Any]:
+             force_new: bool = False, priority: int | None = None,
+             pin: bool | None = None, project: str = "") -> dict[str, Any]:
     """Save one memory/decision for the current user. Returns the new path/id.
 
     写入前先做 Observation 判定（2026-11-18，账号主定），返回的 observation.action 就是处置：
@@ -143,7 +144,8 @@ def remember(text: str, kind: str = "event", title: str = "", topics: str = "",
         user = _need_user()
         return service.remember(user["id"], text, kind=kind, title=title, topics=topics,
                                 source=source, anchor=anchor, supersedes=supersedes,
-                                force_new=force_new)
+                                force_new=force_new, priority=priority,
+                                pin=pin, project=project)
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -185,6 +187,49 @@ def capabilities() -> dict[str, Any]:
     """返回服务能力清单（工具、检索链路、身份口径），给客户端做选型。"""
     try:
         return service.capabilities()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool
+def doc_get(doc_id: str, max_chars: int = 20000) -> dict[str, Any]:
+    """Read one memory's full body by path (search only returns a snippet)."""
+    try:
+        user = _need_user()
+        return service.doc_get(user["id"], doc_id, max_chars=max_chars)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool
+def review(doc_id: str, decision: str = "pass", reason: str = "") -> dict[str, Any]:
+    """AI 自审一条待审记忆：pass 转正 / reject 打回 / force 跳过检查（须 reason）。"""
+    try:
+        user = _need_user()
+        return service.review(user["id"], doc_id, decision, reason, "ai")
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool
+def rule_set(doc_id: str, priority: int | None = None, pinned: bool | None = None,
+             project: str | None = None, topics: str | None = None,
+             note: str = "") -> dict[str, Any]:
+    """AI 把已存在的记忆提权成规则：调 priority/pin/project/topics，写入规则层。"""
+    try:
+        user = _need_user()
+        return service.rule_set(user["id"], doc_id, priority=priority, pinned=pinned,
+                                project=project, topics=topics, note=note)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@mcp.tool
+def rule_list(include_all: bool = False) -> dict[str, Any]:
+    """列出当前用户生效的规则/权重（include_all=true 连未批准的一起看）。"""
+    try:
+        user = _need_user()
+        return service.rule_list(user["id"], include_all=include_all)
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -638,7 +683,8 @@ def conv_list(since: str = "24h", until: str = "", source: str = "", limit: int 
 
 @mcp.tool
 def conv_search(keyword: str, conv_id: str = "", since: str = "", until: str = "",
-                limit: int = 20, context: int = 1) -> dict[str, Any]:
+                limit: int = 20, context: int = 1, max_chars: int = 400,
+                max_total_chars: int = 24000) -> dict[str, Any]:
     """Search inside conversation messages by keyword; returns seq/role/at/snippet/context/anchor.
 
     不知道在哪条会话时留空 conv_id；已知会话时传 conv_id 只搜这一条。
@@ -647,7 +693,8 @@ def conv_search(keyword: str, conv_id: str = "", since: str = "", until: str = "
     try:
         user = _need_user()
         return service.conv_search(keyword, conv_id=conv_id, since=since, until=until,
-                                   limit=limit, context=context, user_id=user["id"])
+                                   limit=limit, context=context, user_id=user["id"],
+                                   max_chars=max_chars, max_total_chars=max_total_chars)
     except Exception as e:
         return {"error": str(e), "matches": [], "conversations": []}
 
@@ -1099,7 +1146,7 @@ async def http_keys_revoke(request: Request) -> JSONResponse:
 async def http_admin_review(request: Request) -> JSONResponse:
     import hmac as _hmac
     import os as _os
-    expected = (_os.getenv("MEM_REVIEW_TOKEN") or "").strip()
+    expected = (REVIEW_TOKEN or "").strip()
     got = (request.headers.get("x-review-token") or "").strip()
     if not expected or not got or not _hmac.compare_digest(got, expected):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
@@ -1127,7 +1174,7 @@ async def http_admin_review(request: Request) -> JSONResponse:
 async def http_admin_supersede(request: Request) -> JSONResponse:
     import hmac as _hmac
     import os as _os
-    expected = (_os.getenv("MEM_REVIEW_TOKEN") or "").strip()
+    expected = (REVIEW_TOKEN or "").strip()
     got = (request.headers.get("x-review-token") or "").strip()
     if not expected or not got or not _hmac.compare_digest(got, expected):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)

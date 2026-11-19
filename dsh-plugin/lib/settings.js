@@ -53,6 +53,17 @@ export const KNOBS = [
   { key: 'memoryMcpRepo', type: 'text', group: 'setup', format: 'git', default: 'https://github.com/ysyluminous/dsh-zhishu-memory.git' },
   { key: 'pythonBin', type: 'text', group: 'setup', format: 'path', default: '' },
 
+  // 记忆服务本体（原来是 .env 里的那些项）。面板改完重启服务即生效；
+  // 启动时由 mem-float 作为环境变量传给 python，服务不再依赖 .env 文件。
+  { key: 'memDsn', type: 'text', group: 'service', default: '' },
+  { key: 'zhishuDsn', type: 'text', group: 'service', default: '' },
+  { key: 'memDataDir', type: 'text', group: 'service', format: 'path', default: '' },
+  { key: 'memReviewToken', type: 'text', group: 'service', default: '' },
+  { key: 'memDefaultUser', type: 'text', group: 'service', default: 'owner' },
+  { key: 'memRequireKey', type: 'boolean', group: 'service', default: false },
+  { key: 'memDbLabel', type: 'text', group: 'service', default: '' },
+  { key: 'memEnv', type: 'enum', group: 'service', values: ['prod', 'local-dev'], default: 'prod' },
+
   // 备份：0 = 关闭定时，只在手动点「立即备份」时跑。
   { key: 'backupEveryHours', type: 'number', group: 'backup', min: 0, max: 168, step: 1, default: 0 },
   { key: 'backupKeep', type: 'number', group: 'backup', min: 1, max: 30, step: 1, default: 7 },

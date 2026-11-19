@@ -53,7 +53,9 @@ Click the capsule:
 
 ## Settings
 
-`~/.dsh/zhishu-memory/settings.json`, precedence: file > loader row `config` > code default. The file is written by the workbench; hand-editing is fine, unknown keys are ignored and out-of-range values are clamped.
+Everything the service needs — DSNs, file-store directory, review token, default user, require-key, instance identity — lives in **Workbench → Config** and is written to `~/.dsh/zhishu-memory/settings.json`. Precedence: process environment (what the controller passes on start) > panel file > code default. The workbench writes the file; hand-editing is fine, unknown keys are ignored and out-of-range values are clamped.
+
+A `.env` next to the service source is now **optional** (kept only for running the service standalone, outside DSH): the service itself falls back to the panel file, so removing `.env` does not cut it off from the database.
 
 ## Uninstall
 

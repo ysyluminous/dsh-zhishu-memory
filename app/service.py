@@ -20,6 +20,7 @@ from . import supersede as _supersede
 # 2026-11-18：Observation 写入模型 + 项目开工必读清单（账号主点名，参照 hindsight Observation）
 from . import observation as _observation
 from . import projects as _projects
+from . import rules as _rules
 # 事项实体（2026-11-18）：事后聚类，挂在 remember 之后自己跑
 from . import issues as _issues
 # 统一可见性出口：谁被 supersede 只在这里算一次，查文档的地方统一带 hidden_param()
@@ -493,6 +494,62 @@ def search_public(query: str, limit: int = 10) -> list[dict[str, Any]]:
     ]
 
 
+def _search_rule_results(user_id: str, query: str,
+                         results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """把已批准规则插到 search 结果最前面（pinned 无条件，其他按 query 命中）。"""
+    recs = [r for r in _rules.active(user_id)
+            if r.get("kind") == "rule" or r.get("priority", 50) > 50]
+    if not recs:
+        return results, []
+    by_id = {str(r.get("id")): r for r in results}
+    items: list[dict[str, Any]] = []
+    for rec in recs[:8]:
+        path = rec.get("path") or ""
+        if not path:
+            continue
+        matched = _rule_hit(rec, query)
+        # gate 无条件注入；search 只在 query 命中规则标题/摘要/项目/主题时置顶。
+        if not matched:
+            continue
+        kind = rec.get("kind") or "rule"
+        item = {
+            "scope": "personal", "type": "rule" if kind == "rule" else "doc",
+            "source": "mem.doc", "kind": kind,
+            "id": path, "title": rec.get("title") or "",
+            "snippet": _snippet(rec.get("summary") or "", 320),
+            "score": round(10.0 + (int(rec.get("priority") or 0) / 100.0), 4),
+            "priority": int(rec.get("priority") or 0),
+            "pinned": bool(rec.get("pinned")), "project": rec.get("project") or "",
+            "topics": rec.get("topics") or [], "rule": kind == "rule", "match": matched,
+        }
+        old = by_id.get(path)
+        if old is not None:
+            old.update(item)
+            old["score"] = max(float(old.get("score") or 0), item["score"])
+            item = old
+        else:
+            try:
+                with _conn(MEM_DSN) as c:
+                    with c.cursor() as cur:
+                        cur.execute(
+                            "select body, updated_at from mem.doc where user_id=%s and path=%s",
+                            (user_id, path),
+                        )
+                        row = cur.fetchone()
+                if row:
+                    at = row[1].isoformat() if row[1] else None
+                    item["snippet"] = _snippet(row[0] or "", 320)
+                    item["date"] = at
+                    item["at"] = at
+                    item["anchor"] = _anchor("mem.doc", path, at=at)
+                    results.append(item)
+            except Exception:
+                continue
+        items.append(item)
+    results.sort(key=lambda r: float(r.get("score") or 0), reverse=True)
+    return results, items
+
+
 def search(query: str, user_id: str, limit: int = 10, scope: str = "auto", include_pending: bool = False,
            include_conversations: bool = True) -> dict[str, Any]:
     scope = (scope or "auto").lower()
@@ -505,6 +562,14 @@ def search(query: str, user_id: str, limit: int = 10, scope: str = "auto", inclu
         personal = search_personal(query, user_id, limit, include_pending)
         public = search_public(query, limit)
         results = (personal + public)[:limit]
+
+    # 规则层：已批准规则优先于普通文档；query 命中时置顶。
+    rule_items: list[dict[str, Any]] = []
+    if scope != "public":
+        try:
+            results, rule_items = _search_rule_results(user_id, query, results)
+        except Exception:
+            rule_items = []
 
     # P0（2026-11-19）：文档/会话元数据常常只沾到 query 里的一两个词，
     # 真正「聊过这件事」的会话在 13 万条消息里。单独给一栏会话命中，
@@ -522,6 +587,7 @@ def search(query: str, user_id: str, limit: int = 10, scope: str = "auto", inclu
         "scope": scope,
         "results": results,
         "count": len(results),
+        "rules": rule_items,
         "conversation_hits": conversation_hits,
         "hints": [
             "results 里 type=doc 的用 id（path）按需取正文；type=conversation 的用 conv_search 在会话内定位。",
@@ -529,6 +595,76 @@ def search(query: str, user_id: str, limit: int = 10, scope: str = "auto", inclu
             "只想要某一条会话的全文时用 conv_get(compact=True)；不要整段导出再本地 grep。",
         ],
     }
+
+
+def doc_get(user_id: str, doc_id: str, max_chars: int = 20000) -> dict[str, Any]:
+    """按 path 读一条记忆正文（search 只回 snippet；这里给全文/截断全文）。"""
+    path = (doc_id or "").strip()
+    if not path:
+        raise ValueError("doc_id 不能为空")
+    max_chars = max(200, min(int(max_chars), 100000))
+    with _conn(MEM_DSN) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "select path, kind, title, body, updated_at from mem.doc "
+                "where user_id=%s and path=%s",
+                (user_id, path),
+            )
+            row = cur.fetchone()
+    if not row:
+        return {"ok": False, "error": "not found", "id": path}
+    body = row[3] or ""
+    at = row[4].isoformat() if row[4] else None
+    return {
+        "ok": True, "id": row[0], "kind": row[1], "title": row[2] or "",
+        "updated_at": at, "anchor": _anchor("mem.doc", row[0], at=at),
+        "chars": len(body), "body": body[:max_chars],
+        "truncated": len(body) > max_chars, "max_chars": max_chars,
+    }
+
+
+def rule_set(user_id: str, doc_id: str, priority: int | None = None,
+             pinned: bool | None = None, project: str | None = None,
+             topics: str | None = None, note: str = "") -> dict[str, Any]:
+    """AI 把一条已存在的记忆提权为规则/调整权重（自审，写 rules.jsonl）。"""
+    doc_id = (doc_id or "").strip()
+    if not doc_id:
+        raise ValueError("doc_id 不能为空")
+    if "/pending/" in doc_id:
+        return {"ok": False, "error": "pending 文档先 review 通过，再 rule_set"}
+    with _conn(MEM_DSN) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "select path, kind, title, body from mem.doc where user_id=%s and path=%s",
+                (user_id, doc_id),
+            )
+            row = cur.fetchone()
+    if not row:
+        return {"ok": False, "error": "找不到这条记忆"}
+    rec = _rules.get(doc_id) or {}
+    summary = rec.get("summary") or ""
+    if len(summary) < 400:
+        summary = _snippet(row[3] or "", 1200)
+    updated = _rules.set_rule(
+        doc_id, uid=user_id, kind="rule", title=row[2] or rec.get("title") or "",
+        summary=summary,
+        priority=(priority if priority is not None else rec.get("priority", 100)),
+        pinned=(pinned if pinned is not None else rec.get("pinned", True)),
+        project=(project if project is not None else rec.get("project", "")),
+        topics=(topics if topics is not None else rec.get("topics", [])),
+        approved=True, source=rec.get("source", "rule_set"),
+        anchor=rec.get("anchor", f"mem.doc:{doc_id}"), by="ai",
+    )
+    return {"ok": True, "rule": updated, "note": note or "规则已提权，gate 下一次请求即生效"}
+
+
+def rule_list(user_id: str, include_all: bool = False) -> dict[str, Any]:
+    rows = _rules.active(user_id)
+    if include_all:
+        rows = [r for r in _rules._fold().values() if r.get("uid") == user_id]
+        rows.sort(key=lambda r: (bool(r.get("pinned")), int(r.get("priority") or 0)),
+                  reverse=True)
+    return {"ok": True, "count": len(rows), "rules": rows, "stats": _rules.stats(user_id)}
 
 
 _HELP_GUIDE: dict[str, Any] = {
@@ -553,13 +689,28 @@ _HELP_GUIDE: dict[str, Any] = {
             "example": 'conv_get(conv_id="...", compact=True, limit=100)',
             "notes": "keyword 可在会话内过滤；返回 last_synced_at / sync_status / anchor。",
         },
+        "doc_get": {
+            "when": "search 只回了 snippet，需要读某条记忆/规则的完整正文时。",
+            "example": 'doc_get(doc_id="cloud/owner/20261119-xxx.md", max_chars=20000)',
+        },
         "gate": {
             "when": "回答前强制取回相关上下文；DSH 插件每轮自动调用。",
             "example": 'gate(query="...", source="dsh", conversation_id="...")',
         },
         "remember": {
-            "when": "写入结论/决策；带 anchor（文件:行号 / session / 命令原文）便于以后溯源。",
-            "example": 'remember(text="...", kind="decision", anchor="session-...")',
+            "when": "写入结论/决策/规则；带 anchor（文件:行号 / session / 命令原文）便于以后溯源。",
+            "example": 'remember(text="建表前先盘点老库", kind="rule", priority=100, pin=True, anchor="docs/xxx.md:12")',
+        },
+        "rule_set": {
+            "when": "AI 检索/编码后认为某条记忆应成为铁律：提权、pin、补 project/topics。",
+            "example": 'rule_set(doc_id="cloud/owner/xxx.md", priority=100, pinned=True, project="cms")',
+        },
+        "rule_list": {
+            "when": "看当前生效规则和权重，确认下一次 gate 会注入什么。",
+        },
+        "review": {
+            "when": "AI 自审：把 pending 的规则/结论转正或打回（actor=ai，写 review_log）。",
+            "example": 'review(doc_id="cloud/owner/pending/xxx.md", decision="pass", reason="有出处且无冲突")',
         },
         "pending": {
             "when": "看待审积压有多少条、最老一条多久。",
@@ -571,7 +722,8 @@ _HELP_GUIDE: dict[str, Any] = {
             "when": "记录这条记忆是否有用；可选 0-5 分项评分。",
         },
     },
-    "order": ["search → conversation_hits", "conv_search (定位)", "conv_get (compact → 局部)"],
+    "order": ["规则层（gate 无条件注入）", "search → conversation_hits",
+              "conv_search (定位)", "conv_get (compact → 局部)"],
 }
 
 
@@ -581,10 +733,12 @@ def help_text(topic: str = "") -> dict[str, Any]:
     if not key:
         return {"ok": True, **_HELP_GUIDE}
     aliases = {
-        "search": ["search", "conv_search", "conv_list", "conv_get"],
-        "conversation": ["search", "conv_search", "conv_list", "conv_get"],
+        "search": ["search", "conv_search", "conv_list", "conv_get", "doc_get"],
+        "conversation": ["search", "conv_search", "conv_list", "conv_get", "doc_get"],
         "write": ["remember", "pending"],
-        "review": ["pending", "doc_history", "feedback"],
+        "review": ["pending", "doc_history", "feedback", "review"],
+        "rule": ["remember", "rule_set", "rule_list", "review"],
+        "rules": ["remember", "rule_set", "rule_list", "review"],
     }
     names = aliases.get(key)
     if not names:
@@ -605,12 +759,14 @@ def capabilities() -> dict[str, Any]:
         "transport": "MCP streamable HTTP + REST mirror",
         "tools": sorted(_HELP_GUIDE["tools"]),
         "retrieval": {
-            "search": "docs + conversation metadata + conversation_hits (message-level)",
+            "search": "docs + conversation metadata + conversation_hits; approved rules rank first",
             "conv_search": "keyword search inside one/all conversations, returns anchors",
-            "conv_get": "transcript with compact/keyword/last_synced_at",
+            "conv_get": "transcript with compact/keyword/last_synced_at/reconcile",
+            "doc_get": "read a memory/rule body by path after search",
+            "rules": "remember(kind=rule, priority, pin, project) → auto-review → gate injects unprompted",
         },
         "identity": "x-api-key；未开 REQUIRE_KEY 时落到 MEM_DEFAULT_USER",
-        "help": "help(topic='search'|'conversation'|'write'|'review')",
+        "help": "help(topic='search'|'conversation'|'write'|'review'|'rule')",
     }
 
 # ---------------- 写入幂等键（2026-11-18 老大定） ----------------
@@ -668,7 +824,8 @@ def _idem_record(key: str, doc_id: str) -> None:
 def remember(user_id: str, text: str, kind: str = "event", title: str = "", topics: str = "",
              source: str = "", anchor: str = "", supersedes: str = "",
              force_new: bool = False, idem_key: str = "",
-             conversation_id: str = "") -> dict[str, Any]:
+             conversation_id: str = "", priority: int | None = None,
+             pin: bool | None = None, project: str = "") -> dict[str, Any]:
     body = (text or "").strip()
     if not body:
         raise ValueError("内容不能为空")
@@ -686,17 +843,38 @@ def remember(user_id: str, text: str, kind: str = "event", title: str = "", topi
     first = body.splitlines()[0].strip().lstrip("#").strip()
     title = (title or first)[:120]
     topic_list = [t.strip() for t in (topics or "").split(",") if t.strip()]
+    rule_mode = kind == "rule"
+    # 规则/经验默认最高权重并常驻 gate；普通文档显式传 priority/pin 才进入权重层。
+    boost_requested = rule_mode or priority is not None or pin is not None or bool(project)
+    try:
+        priority = 100 if rule_mode and priority is None else max(
+            1, min(100, int(priority if priority is not None else 50)))
+    except (TypeError, ValueError):
+        priority = 100 if rule_mode else 50
+    pinned = True if rule_mode and pin is None else bool(pin)
+    project = (project or "").strip()
+    body_core = body
+    if rule_mode:
+        bits = [f"priority={priority}", f"pin={'true' if pinned else 'false'}"]
+        if project:
+            bits.append(f"project={project}")
+        if topic_list:
+            bits.append("topics=" + ",".join(topic_list))
+        body = body_core + "\n\n[rule] " + " ".join(bits)
     digest = hashlib.sha256(body.encode()).hexdigest()
     day = datetime.now().strftime("%Y%m%d")
     # v1 review-gated：path 就是状态（零 DDL）。
     #
     # v1.6 豁免（2026-11-17 幕后大佬定）：**所有 kind=event 一律直接入库，不进 pending**。
-    # 为什么放宽：event 是「发生了什么」＝事实记录，不构成「该怎么做」，不会误导判断；
-    #   decision/artifact/belief/metric/entity 才是结论，会改变判断，闸必须留。
-    # 为什么废掉 title~^session- 那条：原来只豁免插件自动摘要，结果所有交付回执、验收记录、
-    #   踩坑日志都进 pending（今天 26 条、昨晚 16 条），审的人只能 force 硬过 —— 闸门形同虚设。
-    #   用「标题前缀」当判据本来就是启发式（今天第三次栽在这类启发式上），改成按 kind 分。
-    auto_writeback = kind == "event"
+    # 2026-11-19：kind=rule 走 AI 自审快车道（默认开，MEM_RULE_AUTOREVIEW=0 可关）：
+    #   规则是「该怎么做」，必须让下一次 CREATE TABLE 前看得到；埋在 90 条 pending 里等于没有。
+    #   入口处仍写 review_log(auto_pass) + rules.jsonl，保留可追溯/可撤销。
+    rule_auto = bool(
+        rule_mode
+        and os.getenv("MEM_RULE_AUTOREVIEW", "1").strip().lower() not in ("0", "off", "false", "no")
+        and len(body_core) >= 40
+    )
+    auto_writeback = kind == "event" or rule_auto
     path_dir = f"cloud/{user_id}" if auto_writeback else f"cloud/{user_id}/pending"
     path = f"{path_dir}/{day}-{digest[:8]}.md"
 
@@ -787,7 +965,16 @@ def remember(user_id: str, text: str, kind: str = "event", title: str = "", topi
                  "auto" if auto_writeback else "user",
                  old_hash=(prev_row[0] if prev_row else ""), new_hash=digest,
                  old_len=(prev_row[1] if prev_row else None), new_len=len(body),
-                 reason=("write-back 摘要豁免" if auto_writeback else ""))
+                 reason=(("rule auto-review" if rule_auto else
+                          ("write-back 摘要豁免" if auto_writeback else ""))))
+    rule_rec = None
+    if boost_requested:
+        rule_rec = _rules.set_rule(
+            path, uid=user_id, kind=kind, title=title, summary=_snippet(body_core, 1200),
+            priority=priority, pinned=pinned, project=project, topics=topic_list,
+            approved=auto_writeback, source=source, anchor=anchor,
+            by="auto" if auto_writeback else "ai",
+        )
     if auto_writeback:
         # 豁免必须留痕：每天早上要能数出「昨天自动通过了几条」，否则这条豁免就是法外之地。
         _review_log({
@@ -797,7 +984,9 @@ def remember(user_id: str, text: str, kind: str = "event", title: str = "", topi
             "title": title,
             "decision": "auto_pass",
             "auto": True,
-            "reason": "write-back 摘要豁免（kind=event 且 title~^session-）：v1.5 临时方案，v2 改显式 auto_approved 参数",
+            "reason": ("规则类 AI 自审快车道（MEM_RULE_AUTOREVIEW）；入口即写 rules.jsonl"
+                       if rule_auto else
+                       "write-back 摘要豁免（kind=event）：v1.5 临时方案，v2 改显式 auto_approved 参数"),
         })
     # 事后聚类（2026-11-18）：写完就自己找事项，挂不上记 orphan，绝不打断写入、绝不反问。
     assign: dict[str, Any] = {}
@@ -808,7 +997,9 @@ def remember(user_id: str, text: str, kind: str = "event", title: str = "", topi
     _idem_record(idem, path)
     return {"ok": True, "id": path, "kind": kind, "title": title, "topics": topic_list,
             "observation": obs_out, "issue": assign, "idem": "miss", "idem_key": idem,
-            "auto_approved": auto_writeback}
+            "auto_approved": auto_writeback,
+            "priority": priority, "pinned": bool(pinned), "project": project,
+            "rule": rule_rec}
 
 
 def _doc_meta(path: str, user_id: str) -> dict[str, str] | None:
@@ -1525,7 +1716,9 @@ def conv_list(since: str = "24h", until: str = "", source: str = "", limit: int 
                     "unreconciled": r[5],
                     "sync_status": "live" if r[5] else "reconciled",
                     "last_user": (r[6] or "")[:300]})
-    return {"count": len(out), "conversations": out}
+    return {"count": len(out), "conversations": out,
+            "reconcile_note": "unreconciled 是 live_event 里尚未回填到 conv_message 的增量消息；"
+                              "message_count 只统计已对账部分，可能为 0 或偏小，读取/检索不丢。"}
 
 
 def conv_get(conv_id: str, since: str = "", until: str = "", limit: int = 100,
@@ -1551,7 +1744,7 @@ def conv_get(conv_id: str, since: str = "", until: str = "", limit: int = 100,
     extra = (" and " + " and ".join(conds)) if conds else ""
     with _conn(MEM_DSN) as c:
         with c.cursor() as cur:
-            cur.execute("select id,source,title,updated_at from mem.conv where id=%s", (conv_id,))
+            cur.execute("select id,source,title,updated_at,message_count from mem.conv where id=%s", (conv_id,))
             meta = cur.fetchone()
             if not meta:
                 raise ValueError("参数不合法")
@@ -1612,6 +1805,16 @@ def conv_get(conv_id: str, since: str = "", until: str = "", limit: int = 100,
             "last_synced_at": last_synced,
             "sync_status": "live" if unreconciled else "reconciled",
             "unreconciled": unreconciled,
+            "message_count": meta[4] or 0,
+            "reconcile": {
+                "status": "live" if unreconciled else "reconciled",
+                "unreconciled": unreconciled,
+                "reconciled_message_count": meta[4] or 0,
+                "note": ("unreconciled=%d 是 live_event 里尚未回填到 conv_message 的增量消息；"
+                         "它们已计入 total/messages，读取和检索不丢。mem.conv.message_count "
+                         "只统计已对账部分，所以可能为 0 或偏小，不代表会话是空的。"
+                         % unreconciled),
+            },
             "keyword": kw, "compact": bool(compact), "max_chars": max_chars,
             "total": total, "offset": offset, "returned": len(messages),
             "backend": "pg", "messages": messages}
@@ -1646,8 +1849,90 @@ def _conv_terms(keyword: str, cap: int = 12) -> list[str]:
     return out[:cap]
 
 
+_SEMANTIC_GROUPS = (
+    ("改成", "改为", "换成", "切换", "调整为", "改到", "改成"),
+    ("决定", "拍板", "定了", "定稿", "结论", "采用", "选择", "最终"),
+    ("停用", "废弃", "撤掉", "不要", "下线", "删除"),
+    ("上线", "发布", "部署", "落地", "生效"),
+    ("问题", "报错", "失败", "超时", "修复", "修好"),
+)
+_DECISION_RE = re.compile(r"(决定|拍板|定了|定稿|最终|结论|采用|就按|改成|改为|切换|调整为)")
+_CODE_MARKERS = ("```", "select ", "insert ", "update ", "create table", "| ---",
+                 "cms_", "curl ", "python ", "git ")
+
+
+def _looks_like_code(low: str) -> bool:
+    return sum(1 for marker in _CODE_MARKERS if marker in low) >= 2
+
+
+def _char_cosine(a: str, b: str) -> float:
+    """字符 2-gram 余弦：中文短查询的模糊相似，比纯词命中多一点「像不像」。"""
+    def grams(text: str) -> dict[str, int]:
+        t = re.sub(r"\s+", "", (text or "").lower())
+        if len(t) < 2:
+            return {t: 1} if t else {}
+        out: dict[str, int] = {}
+        for i in range(len(t) - 1):
+            g = t[i:i + 2]
+            out[g] = out.get(g, 0) + 1
+        return out
+    ga, gb = grams(a), grams(b)
+    if not ga or not gb:
+        return 0.0
+    dot = sum(v * gb.get(k, 0) for k, v in ga.items())
+    na = math.sqrt(sum(v * v for v in ga.values()))
+    nb = math.sqrt(sum(v * v for v in gb.values()))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def _semantic_profile(query: str) -> dict[str, Any]:
+    q = (query or "").lower()
+    groups = [g for g in _SEMANTIC_GROUPS if any(w.lower() in q for w in g)]
+    entities = [e for e in re.findall(r"[A-Za-z][A-Za-z0-9_.\-]{2,}", query or "")]
+    expanded = _expand_synonyms([query] if query else [])
+    return {"groups": groups, "entities": list(dict.fromkeys(entities))[:8],
+            "expanded": [t for t in expanded if t != query][:12],
+            "decision_intent": any(g in groups for g in (_SEMANTIC_GROUPS[0], _SEMANTIC_GROUPS[1], _SEMANTIC_GROUPS[2])),
+            "query_text": query}
+
+
+def _semantic_score(text: str, profile: dict[str, Any], role: str = "") -> float:
+    if os.getenv("MEM_SEMANTIC", "1").strip().lower() in ("0", "off", "false", "no"):
+        return 0.0
+    low = (text or "").lower()
+    if not low:
+        return 0.0
+    score = 0.0
+    for group in profile.get("groups") or []:
+        if any(w.lower() in low for w in group):
+            score += 0.30
+    hits = sum(1 for t in profile.get("expanded") or [] if t.lower() in low)
+    score += min(0.25, 0.06 * hits)
+    score += 0.20 * _char_cosine(profile.get("query_text") or "", low)
+    if profile.get("entities") and any(e.lower() in low for e in profile["entities"]):
+        score += 0.25
+    # 决策/变更意图：有「决定/改成/拍板」等结论句的优先；代码块降权。
+    if profile.get("decision_intent"):
+        if _DECISION_RE.search(low):
+            score += 0.30
+        # 关键：决策词要离实体近（「改成 cms_book」），别让一篇长表结构里
+        # 恰好同时出现「改成」和 cms_book 就抢到语义分。
+        for entity in profile.get("entities") or []:
+            pos = low.find(entity.lower())
+            if pos >= 0 and _DECISION_RE.search(
+                    low[max(0, pos - 120):pos + len(entity) + 120]):
+                score += 0.25
+                break
+        if _looks_like_code(low):
+            score -= 0.25
+        if role == "user" and any(w in low for w in ("改成", "改为", "切换", "决定")):
+            score += 0.08
+    return max(0.0, min(1.0, score))
+
+
 def conv_search(keyword: str, conv_id: str = "", since: str = "", until: str = "",
-                limit: int = 20, context: int = 1, user_id: str = "owner") -> dict:
+                limit: int = 20, context: int = 1, user_id: str = "owner",
+                max_chars: int = 400, max_total_chars: int = 24000) -> dict:
     """会话内关键词检索：返回 seq/role/at/上下文/片段，可直接定位到某条消息。
 
     P0（2026-11-19 WorkBuddy 首次接入）：之前只能 conv_get 整段翻页，5157 条消息
@@ -1658,6 +1943,8 @@ def conv_search(keyword: str, conv_id: str = "", since: str = "", until: str = "
         raise ValueError("keyword 不能为空")
     limit = max(1, min(int(limit), 50))
     context = max(0, min(int(context), 3))
+    max_chars = max(80, min(int(max_chars), 2000))
+    max_total_chars = max(4000, min(int(max_total_chars), 60000))
     start = _ms(since, None)
     end = _ms(until, None)
     terms = _conv_terms(kw)
@@ -1710,6 +1997,7 @@ def conv_search(keyword: str, conv_id: str = "", since: str = "", until: str = "
                     break
 
     part_terms = {p for p in _TERM_SPLIT.split(kw) if p}
+    profile = _semantic_profile(kw)
     matches: list[dict[str, Any]] = []
     for hit in seen.values():
         row, matched = hit["row"], sorted(hit["terms"])
@@ -1721,6 +2009,9 @@ def conv_search(keyword: str, conv_id: str = "", since: str = "", until: str = "
         at = row[3].astimezone().isoformat() if row[3] else None
         conv = row[0]
         weight = sum(3 if t == kw else (2 if t in part_terms else 1) for t in matched)
+        literal = min(1.0, weight / max(1.0, 3.0 * len(matched)))
+        semantic = _semantic_score(text, profile, role=row[2])
+        score = 0.6 * literal + 0.4 * semantic
         matches.append({
             "scope": "personal",
             "type": "message",
@@ -1734,17 +2025,50 @@ def conv_search(keyword: str, conv_id: str = "", since: str = "", until: str = "
             "role": row[2],
             "at": at,
             "anchor": _anchor("mem.conv", conv, row[1], at),
-            "snippet": _snippet_around(text, kw if kw.lower() in low else matched[0], 160),
+            "snippet": _snippet_around(text, kw if kw.lower() in low else matched[0],
+                                       max(40, max_chars // 2))[:max_chars],
             "matched_terms": matched[:8],
-            "score": weight,
+            "literal_score": round(literal, 4),
+            "semantic_score": round(semantic, 4),
+            "score": round(score, 4),
             "synced_at": row[5].astimezone().isoformat() if row[5] else None,
         })
     matches.sort(key=lambda m: (m["score"], m["updated_at"] or "", m["seq"]), reverse=True)
-    matches = matches[:limit]
 
-    # 每条命中补前后各 context 条，AI 不用再发一次 conv_get 才能看懂。
+    # 两段式：先取 2 倍候选，补上下文后用「邻近消息」再算一次语义分，再定最终 limit。
+    candidates = matches[:max(limit * 2, limit)]
     if context > 0:
-        _attach_contexts(matches, context)
+        _attach_contexts(candidates, context, max_chars=max_chars)
+        for match in candidates:
+            ctx_text = " ".join(c.get("text", "") for c in match.get("context") or [])
+            if ctx_text:
+                ctx_sem = _semantic_score(ctx_text, profile)
+                match["semantic_score"] = round(
+                    min(1.0, match["semantic_score"] * 0.8 + ctx_sem * 0.2), 4
+                )
+                match["score"] = round(
+                    0.6 * match["literal_score"] + 0.4 * match["semantic_score"], 4
+                )
+        candidates.sort(key=lambda m: (m["score"], m["updated_at"] or "", m["seq"]), reverse=True)
+    matches = candidates[:limit]
+
+    # 输出预算：context[] 和 snippet 都按 max_chars 截，总字符超 max_total_chars 时
+    # 从后往前丢上下文（保留命中本身和 anchor），并显式标记 truncated。
+    used = 0
+    output_truncated = False
+    for match in matches:
+        keep = []
+        for item in match.get("context") or []:
+            if used + len(item.get("text", "")) > max_total_chars:
+                output_truncated = True
+                break
+            keep.append(item)
+            used += len(item.get("text", ""))
+        if len(keep) < len(match.get("context") or []):
+            output_truncated = True
+        match["context"] = keep
+        used += len(match.get("snippet", ""))
+    output_chars = used
 
     conversations: dict[str, dict[str, Any]] = {}
     for match in matches:
@@ -1756,28 +2080,44 @@ def conv_search(keyword: str, conv_id: str = "", since: str = "", until: str = "
             "last_synced_at": match["last_synced_at"],
             "message_count": match["message_count"],
             "hits": 0,
+            "best_score": 0.0,
         })
         item["hits"] += 1
+        item["best_score"] = max(item["best_score"], match["score"])
     return {
         "keyword": kw,
         "count": len(matches),
         "matches": matches,
         "conversations": list(conversations.values()),
+        "max_chars": max_chars,
+        "max_total_chars": max_total_chars,
+        "output_chars": output_chars,
+        "truncated": output_truncated,
+        "scoring": {
+            "mode": "literal+semantic",
+            "literal_weight": 0.6,
+            "semantic_weight": 0.4,
+            "semantic_mode": "intent + synonym + char-ngram + neighbor-context (no embedding channel)",
+            "switch": "MEM_SEMANTIC=0 回退纯字面",
+        },
         "hint": "拿 match.anchor / conversation_id+seq 就能回溯；要更多上下文用 conv_get(conv_id, compact=True)。",
     }
 
 
-def _attach_contexts(matches: list[dict[str, Any]], radius: int = 1) -> None:
+def _attach_contexts(matches: list[dict[str, Any]], radius: int = 1,
+                     max_chars: int = 400) -> None:
     """一次把同一会话的多个命中窗口查完，避免 5 条命中发 5 次远程查询。"""
     groups: dict[str, set[int]] = {}
     for match in matches:
         seq = int(match.get("seq") or 0)
+        if seq <= 0:
+            continue
         groups.setdefault(match["conversation_id"], set()).update(
             range(seq - radius, seq + radius + 1)
         )
     buckets: dict[str, dict[int, list[dict[str, Any]]]] = {}
     for conv_id, seqs in groups.items():
-        wanted = sorted(s for s in seqs if s >= 0)
+        wanted = sorted(s for s in seqs if s > 0)
         if not wanted:
             continue
         with _conn(MEM_DSN) as c:
@@ -1795,11 +2135,17 @@ def _attach_contexts(matches: list[dict[str, Any]], radius: int = 1) -> None:
                 )
                 rows = cur.fetchall()
         bucket: dict[int, list[dict[str, Any]]] = {}
+        seen: set[tuple[int, str, str]] = set()
         for row in rows:
+            # live_event 与 conv_message 可能有同一条消息的两份副本；按 seq+role+正文去重。
+            key = (row[0], row[1], (row[3] or "")[:120])
+            if key in seen:
+                continue
+            seen.add(key)
             at = row[2].astimezone().isoformat() if row[2] else None
             bucket.setdefault(row[0], []).append({
                 "seq": row[0], "role": row[1], "at": at,
-                "text": _snippet(row[3], 600),
+                "text": _snippet(row[3], max_chars),
                 "anchor": _anchor("mem.conv", conv_id, row[0], at),
                 "synced_at": row[4].astimezone().isoformat() if row[4] else None,
             })
@@ -1807,11 +2153,13 @@ def _attach_contexts(matches: list[dict[str, Any]], radius: int = 1) -> None:
     for match in matches:
         seq = int(match.get("seq") or 0)
         bucket = buckets.get(match["conversation_id"], {})
-        match["context"] = [
+        context = [
             item
             for s in range(seq - radius, seq + radius + 1)
             for item in bucket.get(s, [])
         ]
+        # 同一 seq 可能有多角色副本；只保留前后 2*radius+1 条，避免输出膨胀。
+        match["context"] = context[: 2 * radius + 1]
 
 
 
@@ -2218,6 +2566,60 @@ def _build_context(merged: list[dict]) -> str:
     return head + "\n".join(blocks)
 
 
+def _rule_hit(rec: dict[str, Any], query: str, project: str = "") -> bool:
+    q = (query or "").lower()
+    blob = " ".join([
+        str(rec.get("title") or ""), str(rec.get("summary") or ""),
+        str(rec.get("project") or ""), " ".join(rec.get("topics") or []),
+    ]).lower()
+    if project and str(rec.get("project") or "").lower() == project.lower():
+        return True
+    terms = [t for t in re.split(r"[\s,，。;；、/|]+", q) if len(t) >= 2]
+    return any(t in blob for t in terms)
+
+
+def _gate_rule_items(user_id: str, query: str, project: str = "") -> list[dict[str, Any]]:
+    """已批准的规则无条件注入；pinned/priority/项目命中决定顺序，最多 5 条。"""
+    rows = [r for r in _rules.active(user_id) if r.get("kind") == "rule"]
+    if not rows:
+        return []
+    for rec in rows:
+        rec["_match"] = _rule_hit(rec, query, project)
+    rows.sort(key=lambda r: (bool(r.get("pinned")), bool(r.get("_match")),
+                             int(r.get("priority") or 0), str(r.get("ts") or "")),
+              reverse=True)
+    items = []
+    for rec in rows[:5]:
+        items.append({
+            "scope": "personal", "type": "rule", "source": "mem.doc", "kind": "rule",
+            "id": rec.get("path"), "title": rec.get("title") or "",
+            "snippet": _snippet(rec.get("summary") or "", 900),
+            "score": 100.0 + float(rec.get("priority") or 0),
+            "priority": int(rec.get("priority") or 0),
+            "pinned": bool(rec.get("pinned")),
+            "project": rec.get("project") or "",
+            "topics": rec.get("topics") or [],
+            "match": bool(rec.get("_match")),
+        })
+    return items
+
+
+def _render_rule_block(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return ""
+    lines = ["## 规则（最高优先级，先于检索结果；已由 AI 自审/人工批准）"]
+    used = len(lines[0])
+    for i, item in enumerate(items, 1):
+        mark = " pin" if item.get("pinned") else ""
+        line = (f"{i}. [rule/{item.get('priority')}{mark}] {item.get('title')}\n"
+                f"   {_snippet(item.get('snippet') or '', 800)}")
+        if used + len(line) > 2400 and i > 1:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines)
+
+
 def gate(query: str, user_id: str, source: str = "gate", conversation_id: str = "",
          role: str = "user", limit: int = 5, turn: int | None = None,
          include_pending: bool = False, log_sink: dict | None = None) -> dict:
@@ -2292,24 +2694,36 @@ def gate(query: str, user_id: str, source: str = "gate", conversation_id: str = 
         except Exception:
             pass  # core 注入失败不能把 gate 拖死
         lap = _lap("core", lap)
-        context = _build_context(merged)
-        # 项目开工必读（2026-11-18）：按「项目词 + 任务词」双命中推规范清单，
-        # 不看检索分数——规矩是「动这块就该读」，跟这个问题像不像没关系。
+        # 项目开工必读 + 规则层：规则先于检索结果，pinned/priority 决定顺序。
         proj: dict[str, Any] = {"matched": False, "project": "", "reads": [], "block": ""}
         try:
             proj = _projects.match(q)
-            if proj.get("matched"):
-                context = proj["block"] + "\n\n" + context
         except Exception:
-            proj = {"matched": False, "project": "", "reads": [], "block": ""}
+            pass
+        rule_items: list[dict[str, Any]] = []
+        try:
+            rule_items = _gate_rule_items(user_id, q, proj.get("project") or "")
+            if rule_items:
+                rule_ids = {item.get("id") for item in rule_items}
+                merged = [r for r in merged if r.get("id") not in rule_ids]
+        except Exception:
+            rule_items = []
+        context = _build_context(merged)
+        rule_block = _render_rule_block(rule_items)
+        if rule_block:
+            context = rule_block + "\n\n" + context
+        if proj.get("matched"):
+            context = proj["block"] + "\n\n" + context
         lap = _lap("assemble", lap)
         latency = _gate_elapsed_ms(t0)
-        log_id = _gate_log(user_id, source, conversation_id, turn, q, merged, len(context),
+        logged = [*rule_items, *merged]
+        log_id = _gate_log(user_id, source, conversation_id, turn, q, logged, len(context),
                            latency, stage_ms=stages, slow=latency >= GATE_SLOW_MS)
         stages["log"] = _gate_elapsed_ms(lap)
         if log_sink is not None:
             log_sink["id"] = log_id
         return {"ok": True, "trace_id": trace, "query": q, "count": len(merged),
+                "rule_count": len(rule_items), "rules": rule_items,
                 "results": merged, "context": context,
                 "project_reads": {k: proj.get(k) for k in ("matched", "project", "hits", "reads")}}
     except Exception as e:
@@ -2328,7 +2742,7 @@ def gate(query: str, user_id: str, source: str = "gate", conversation_id: str = 
 #   review 通过才把 path 从 pending/ 移回正式区，并同步 mem.edge.src（图谱别断链）。
 # ---------------------------------------------------------------------------
 
-_ALLOWED_KINDS = {"event", "decision", "artifact", "entity", "belief", "metric"}
+_ALLOWED_KINDS = {"event", "decision", "artifact", "entity", "belief", "metric", "rule"}
 # 出处检查（2026-11-17 扩形态）：只认 `session-xxx` / `文件:行号` / 命令原文的旧正则，
 # 会把「带仓库相对路径」的正经出处判成「无出处」——守库人 26 条待审里 17 条被迫走 force，
 # 闸门等于没有。所以按形态枚举，不再靠一套窄正则猜：
@@ -2534,6 +2948,10 @@ def review(user_id: str, doc_id: str, decision: str = "pass", reason: str = "", 
                     _issues.mark_rejected(path, "; ".join(problems)[:160], reject_path)
                 except Exception:
                     pass
+                try:
+                    _rules.remove(path)
+                except Exception:
+                    pass
                 c.commit()
                 return {"ok": False, "id": path, "archived_to": reject_path,
                         "decision": "rejected", "problems": problems,
@@ -2564,6 +2982,10 @@ def review(user_id: str, doc_id: str, decision: str = "pass", reason: str = "", 
             # 事项关联也跟着搬（否则链接指向已不存在的 pending 路径）。
             try:
                 _issues.mark_moved(path, new_path)
+            except Exception:
+                pass
+            try:
+                _rules.approve(path, new_path)
             except Exception:
                 pass
             if supersede_of:

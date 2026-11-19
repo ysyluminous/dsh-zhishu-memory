@@ -32,6 +32,11 @@ MCP 入口：`POST /mcp`。
 `#mcp` 页回答「谁连上来了、调了什么、成没成」——客户端名/版本、key 指纹、IP、
 每次 `initialize` / `tools/call` 的耗时与结果，审计写本机 JSONL，库不可用时也能看。
 
+规则层（2026-11-19）：`remember(kind="rule", priority=100, pin=True, project=..., topics=...)`
+默认 AI 自审，规则写 `data/audit/rules.jsonl`；gate 在检索前**无条件注入**已批准规则，
+search 命中时置顶。AI 可用 `rule_set` 给已有记忆提权，`rule_list` 看生效规则，
+`review` 自审 pending。`MEM_RULE_AUTOREVIEW=0` 可关自动。
+
 ## 架构
 
 ```

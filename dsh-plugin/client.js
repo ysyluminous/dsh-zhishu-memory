@@ -235,6 +235,38 @@ window.__ModuleLoader__.load({
             label: 'Python 可执行文件',
             hint: '留空自动用 python / python3；一键安装依赖时用。',
           },
+          memDsn: {
+            label: '记忆库 DSN（mem）',
+            hint: '形如 postgresql://postgres:密码@主机:端口/mem?sslmode=disable。以前写在 .env 的 MEM_DSN，现在放这里；启动服务时传给 python。',
+          },
+          zhishuDsn: {
+            label: '业务库 DSN（zhishu）',
+            hint: '公开检索（CMS/X/协调数据）用的库；以前是 .env 的 ZHISHU_DSN。只做个人记忆可以不填。',
+          },
+          memDataDir: {
+            label: '文件型存储目录',
+            hint: 'core / observations / issues / doc_history 这些 JSONL 的根目录（原来靠 MEM_DATA_DIR）。两台实例共库时指到同一份。',
+          },
+          memReviewToken: {
+            label: '审核令牌',
+            hint: '/admin/review、/admin/supersede 用的 x-review-token；以前是 .env 的 MEM_REVIEW_TOKEN。不审就不用填。',
+          },
+          memDefaultUser: {
+            label: '默认用户',
+            hint: '本地模式（不强制 Key）下所有写入归到这个账号；默认 owner。',
+          },
+          memRequireKey: {
+            label: '强制 Key',
+            hint: '开：MCP 必须带 x-api-key 才能连（插件自己的桥也要配）。关：本地免 Key，只用于审计认人。',
+          },
+          memDbLabel: {
+            label: '库标签',
+            hint: '只显示用（/health、控制台头部），写个「主机:端口/库名」方便一眼区分两套库；不含密码。',
+          },
+          memEnv: {
+            label: '实例身份',
+            hint: 'prod = 线上库；local-dev = 本机库。会显示在 /health 与控制台，用来区分两个实例。',
+          },
           backupEveryHours: {
             label: '定时备份间隔',
             hint: '0 = 只手动备份；24 = 每天一次。改动下一轮生效。',
@@ -462,6 +494,38 @@ window.__ModuleLoader__.load({
           pythonBin: {
             label: 'Python executable',
             hint: 'Leave empty to use python / python3; used when installing dependencies.',
+          },
+          memDsn: {
+            label: 'Memory DB DSN (mem)',
+            hint: 'postgresql://postgres:secret@host:port/mem?sslmode=disable — the old MEM_DSN from .env. Passed to the service as an environment variable on start.',
+          },
+          zhishuDsn: {
+            label: 'Knowledge DB DSN (zhishu)',
+            hint: 'Public retrieval (CMS / X / coordination data). The old ZHISHU_DSN. Optional for personal memory only.',
+          },
+          memDataDir: {
+            label: 'File store directory',
+            hint: 'Root of the JSONL stores (core / observations / issues / doc_history). The old MEM_DATA_DIR; point two instances at the same directory to share it.',
+          },
+          memReviewToken: {
+            label: 'Review token',
+            hint: 'x-review-token for /admin/review and /admin/supersede. The old MEM_REVIEW_TOKEN. Skip if you never review.',
+          },
+          memDefaultUser: {
+            label: 'Default user',
+            hint: 'Local mode (no key required) attributes every write to this account; default owner.',
+          },
+          memRequireKey: {
+            label: 'Require key',
+            hint: 'On: MCP clients must send x-api-key (the plugin bridge needs one too). Off: local mode, keys are only used for audit attribution.',
+          },
+          memDbLabel: {
+            label: 'DB label',
+            hint: 'Display only (/health and the console header), e.g. host:port/db. No password.',
+          },
+          memEnv: {
+            label: 'Instance identity',
+            hint: 'prod = production DB; local-dev = local DB. Shown in /health and the console to tell two instances apart.',
           },
           backupEveryHours: {
             label: 'Backup interval',
