@@ -8,6 +8,8 @@
 
 ### 加
 
+- **切换记忆服务到 `zhishu-memory`（S4）**：`memoryMcpDir` 改指 `D:\code\dsh-zhishu-memory`，服务自带 `/console`、`/keys`、`#mcp` 审计；WorkBuddy 与插件都还是 41012，一行客户端配置没改。实测 `/health`、`/console`、`/keys`、`/console/api/mcp`、`/conversations/search` 全 200，工具数 46。
+- **装上就能用（别人的体验）**：① `memoryMcpRepo` 默认指向公开仓库，新机器「一键装环境」的 memory 步开箱可用，不用先找 Git 地址；② mem-float 装载 8 秒后自动探一次——目录在、服务没跑、用户本次没手动停过，就自动拉起（只启动，不 clone、不 pip install；手动点过「停止」后不再自动起）。
 - **`zhishu-memory` 记忆引擎对齐（S3）**：把 `memory-mcp` 的引擎整块接入 `D:\code\dsh-zhishu-memory\app`（`service.py` + core/history/issues/observation/projects/quality/supersede/visibility + todo_store/growth），46 个 MCP 工具与全部 REST 路由齐活，同时保留 DSH 自己的控制台、`#mcp` 审计、上下文编排与本地模式 Key 放行；文件型存储收敛到 `config.DATA_DIR`（`MEM_DATA_DIR` 可覆盖）。同一个库 + 同一个数据目录下，`/search`、`/conversations/search`、`/stats`、`/issues` 与线上 `memory-mcp` **字节级一致**。
 - **整页工作台新增「MCP 服务」页签**（只在整页里，模态框不出现）：服务状态、MCP 地址、Key 生成/吊销（给别人 `x-api-key` 连）、24h 内谁在调 MCP（客户端 / 版本 / key 指纹 / IP / 耗时 / 成败）、审计文件位置，以及「打开控制台」。数据由 mem-float 新增的 `GET /mcp/status`、`GET/POST /mcp/keys`、`POST /mcp/keys/revoke` 转发到 41012，浏览器不跨域。
 - **`conv_search` 回迁到 `zhishu-memory`**（S1）：从 `memory-mcp` 带回 `conv_search` + `_conv_terms` / `_snippet_around` / `_anchor` / `_attach_contexts`，MCP 工具与 `GET /conversations/search` 都注册好；带契约测试。同时把 Key 管理在**本地模式**（`MEM_REQUIRE_KEY=0`）下放行给默认账号、`PUBLIC_MCP_URL` 默认跟随 `PORT`。

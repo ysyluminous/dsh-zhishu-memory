@@ -53,8 +53,9 @@ DSH 插件（mem-float）
 | S1 | 检索能力回迁（**已完成 2026-11-19**） | `conv_search` + `_conv_terms` / `_snippet_around` / `_anchor` / `_attach_contexts` 已进 `app/service.py`，MCP 工具 + `GET /conversations/search` 已注册，`tests/test_conv_search_contract.py` 3/3 | 你点名的功能；以新增函数为主，改动面小 | 0.5–1d | 低 | 契约测试 3/3；`GET /conversations/search?q=报告` 返回带 anchor 的命中 |
 | S2 | 插件「MCP 服务」页签（**已完成 2026-11-19**） | 整页新增「MCP 服务」页（状态 / MCP 地址 / Key 生成吊销 / 24h 调用审计 / 打开控制台）；mem-float 新增 `/mcp/status`、`/mcp/keys`、`/mcp/keys/revoke` 转发；本地模式放行 Key 管理 | 你列的“装上就能在设置里启动/看状态/加 key/看日志” | 1d | 低 | 代理联调 8/8（生成→列表→吊销→列表消失）；页面渲染 13/13 |
 | S3 | 引擎对齐（**已完成 2026-11-19**） | 把 `memory-mcp` 的引擎整块接进 `zhishu-memory`：`service.py` + `core/history/issues/observation/projects/quality/supersede/visibility/todo_store/growth_*` + `mcp_server.py`（46 个工具、全部 REST 路由），再重新挂回 DSH 自己的 `McpAuditMiddleware` / `register_console` / `register_context`，并保留本地模式 Key 放行。文件型存储收敛到 `config.DATA_DIR`（默认 `<repo>/data`，`MEM_DATA_DIR` 可指向业务仓 `data/`） | 行为与现在一致，才敢切 | 2–3d（实际 1 轮） | 中 | 见下：REST 5/5 与文件型 7/7 对齐 |
-| S4 | 切换 | `mem-float.memoryMcpDir` → `zhishu-memory`；WorkBuddy `mcp.json` → `zhishu-memory`；41012 由 `zhishu-memory` 占用；`memory-mcp` 归档只读；**给 `zhishu-memory` 的启动环境设 `MEM_DATA_DIR=D:\code\yunxiao\zhishu\data`（或把 data 迁进来）** | 单一记忆 MCP，名字与仓库一致 | 0.5d | 中 | 重启后 `/health` 正常、WorkBuddy 工具列表不变、DSH 插件全绿、审计/Key 可用 |
-| S5 | 收尾 | schema/迁移对齐、备份、回滚脚本、文档（含回退到 `memory-mcp` 的命令） | 可持续维护 | 1d | 低 | `tools/verify.mjs` 全绿；回滚演练一次 |
+| S4 | 切换（**已完成 2026-11-19**） | `memoryMcpDir` → `D:\code\dsh-zhishu-memory`；建 `zhishu-memory/.env`（沿用原 DSN + `MEM_DATA_DIR=D:\code\yunxiao\zhishu\data` + `MEM_DB_LABEL`）；停/起 41012；WorkBuddy 地址不变 | 单一记忆 MCP，名字与仓库一致 | 0.5d | 中 | `/console` 200、`/keys` 200、`/console/api/mcp` 200、46 工具、`/conversations/search` 200；面板 `/mcp/status`、`/mcp/keys` 都有数据 |
+| S5 | 收尾 | ① 把 `data/`（audit/observations/issues）迁进 `zhishu-memory` 并去掉 `MEM_DATA_DIR`；② 本机 `zhishu-mem-pg` 补 trgm 索引（本机库 personal 检索现在会超时）；③ `history.verify()` 的断点（第 541 行）由账号主定怎么修；④ 备份/回滚演练 | 可持续维护 | 1–2d | 低 | `tools/verify.mjs` 全绿；回滚演练一次；本机库检索 <1s |
+| S6 | 发布（让“别人装了就能用”） | 把今天这些改动提交 + 推到 `ysyluminous/dsh-zhishu-memory`（含 `dsh-plugin/`，它目前还是 untracked）；确认一键安装默认 Git 地址能拉到含本版服务的仓库 | 别人装插件 → 一键安装 → 自动启动 | 0.5d | 低 | 全新 profile/新机器上：装插件 → 一键装环境 → 胶囊绿灯、MCP 页可用 |
 
 ### 为什么是这个顺序
 

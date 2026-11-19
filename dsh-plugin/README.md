@@ -24,8 +24,10 @@ First run opens the capsule automatically, because the bundle starts unconfigure
 ## First run
 
 1. The capsule (bottom right) opens itself. **Workbench → Setup** shows what is missing.
-2. Either point it at an existing memory service (any HTTP endpoint that answers `/gate`, `/remember`, `/ingest`, `/health`), or run the one-click setup: PostgreSQL 16 with pgvector, Qdrant, and a memory service, all as local containers on `127.0.0.1`.
+2. Either point it at an existing memory service (any HTTP endpoint that answers `/gate`, `/remember`, `/ingest`, `/health`), or run the one-click setup: PostgreSQL 16 with pgvector, Qdrant, and a memory service, all as local containers on `127.0.0.1`. The memory service's Git URL is pre-filled, so that step is ready out of the box.
 3. Save. Every parameter takes effect on the next turn; no DSH restart.
+
+Once a service directory exists, the controller **starts it automatically 8 seconds after the plugin loads** (it only starts what is already on disk — it never clones or installs by itself). Stop it by hand and it stays stopped for that session; the Setup tab can always start it again.
 
 ## What leaves your machine
 
