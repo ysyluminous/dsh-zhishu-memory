@@ -24,6 +24,14 @@ AI 越用越碎：同一个结论散落在聊天记录、文档、代码注释�
 REST 镜像：`/search`、`/remember`、`/stats`、`/whoami`、`/health`。
 MCP 入口：`POST /mcp`。
 
+任意 MCP 客户端（DSH / WorkBuddy / Claude Code / Codex / Cursor）都可以直接连 `POST /mcp`
+（Streamable HTTP，不需要 stdio 桥）。WorkBuddy 的 `mcp.json` 写法、带 key 的配置和排错见
+[`docs/mcp-clients.md`](docs/mcp-clients.md)。
+
+控制台：`http://127.0.0.1:41012/console`。除了会话 / 上下文 / 门控 / 记忆，
+`#mcp` 页回答「谁连上来了、调了什么、成没成」——客户端名/版本、key 指纹、IP、
+每次 `initialize` / `tools/call` 的耗时与结果，审计写本机 JSONL，库不可用时也能看。
+
 ## 架构
 
 ```

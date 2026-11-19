@@ -1,0 +1,568 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>智枢记忆控制台</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --card:#fff; --line:#e3e6eb; --ink:#1d2129; --ink2:#606770;
+    --accent:#2f6fed; --warn:#b26a00; --warnbg:#fff8e6; --bad:#c0392b; --good:#1f7a45;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--card);
+         border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px}
+  .badge{font-size:12px;padding:2px 8px;border-radius:10px;background:#eef1f5;color:var(--ink2);
+         border:1px solid var(--line);font-family:var(--mono)}
+  .badge.local{background:#fff3e0;color:#a35b00;border-color:#f0d3a8}
+  .badge.prod{background:#fdecea;color:#a12b1d;border-color:#f3c2bc}
+  .spacer{flex:1}
+  main{display:flex;min-height:calc(100vh - 46px)}
+  nav{width:150px;flex:0 0 150px;background:var(--card);border-right:1px solid var(--line);padding:10px 0}
+  nav a{display:block;padding:8px 16px;color:var(--ink2);text-decoration:none;cursor:pointer;
+        font-size:13.5px;border-left:3px solid transparent}
+  nav a.on{color:var(--accent);border-left-color:var(--accent);background:#f2f6ff;font-weight:600}
+  nav a:hover{background:#f5f7fb}
+  section{flex:1;padding:16px 20px;min-width:0}
+  h2{font-size:14px;margin:0 0 12px;font-weight:600}
+  h3{font-size:13px;margin:18px 0 8px;color:var(--ink2);font-weight:600}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin-bottom:12px}
+  .metrics{display:flex;gap:10px;flex-wrap:wrap}
+  .metric{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 14px;min-width:150px}
+  .metric .k{font-size:12px;color:var(--ink2)}
+  .metric .v{font-size:20px;font-family:var(--mono);margin-top:2px}
+  .metric .c{font-size:11.5px;color:var(--ink2);margin-top:2px}
+  table{width:100%;border-collapse:collapse;background:var(--card);font-size:13px}
+  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--ink2);font-weight:600;font-size:12px;background:#fafbfc;position:sticky;top:46px}
+  tbody tr:hover{background:#f6f9ff}
+  tr.click{cursor:pointer}
+  td.num,th.num{text-align:right;font-family:var(--mono)}
+  .muted{color:var(--ink2)}
+  .mono{font-family:var(--mono);font-size:12.5px}
+  .tag{display:inline-block;font-size:11px;padding:1px 6px;border-radius:4px;background:#eef1f5;
+       color:var(--ink2);font-family:var(--mono)}
+  .tag.doc{background:#e8f1ff;color:#1d4ed8}
+  .tag.conv{background:#e9f7ef;color:#1f7a45}
+  .tag.entity{background:#f4ecff;color:#6b34c9}
+  .tag.unknown{background:#fdecea;color:#a12b1d}
+  .note{background:var(--warnbg);border:1px solid #f0d3a8;color:#6b4400;border-radius:6px;
+        padding:8px 12px;font-size:12.5px;margin-bottom:12px}
+  .note b{color:var(--warn)}
+  input,select,button{font:inherit;font-size:13px;padding:5px 9px;border:1px solid var(--line);
+        border-radius:6px;background:#fff;color:var(--ink)}
+  button{cursor:pointer}
+  button:hover{border-color:#b9c2cf}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+  .pager{display:flex;gap:8px;align-items:center;margin-top:10px;font-size:12.5px;color:var(--ink2)}
+  pre{background:#0f172a;color:#e6edf7;padding:10px 12px;border-radius:6px;overflow:auto;
+      font:12.5px/1.5 var(--mono);max-height:420px;white-space:pre-wrap;word-break:break-word}
+  .kv{display:grid;grid-template-columns:120px 1fr;gap:2px 12px;font-size:13px}
+  .kv .k{color:var(--ink2)}
+  .kv .v{font-family:var(--mono);word-break:break-all}
+  a.link{color:var(--accent);text-decoration:none;cursor:pointer}
+  a.link:hover{text-decoration:underline}
+  .empty{padding:28px;text-align:center;color:var(--ink2);background:var(--card);
+         border:1px dashed var(--line);border-radius:8px}
+  .ok{color:var(--good)} .err{color:var(--bad)}
+</style>
+</head>
+<body>
+<header>
+  <h1>智枢记忆控制台</h1>
+  <span class="badge" id="envBadge">env …</span>
+  <span class="badge" id="dbBadge">db …</span>
+  <span class="spacer"></span>
+  <span class="muted" style="font-size:12px">只读 · 第一版</span>
+</header>
+<main>
+  <nav>
+    <a data-v="overview" class="on">概览</a>
+    <a data-v="convs">会话</a>
+    <a data-v="ctx">上下文</a>
+    <a data-v="gate">门控日志</a>
+    <a data-v="mcp">MCP 服务</a>
+    <a data-v="docs">记忆与题库</a>
+  </nav>
+  <section id="view"><div class="empty">载入中…</div></section>
+</main>
+<script>
+const view = document.getElementById('view');
+const state = { v:'overview', convOffset:0, ctxConv:'', gateOffset:0, docOffset:0,
+                ctxLimit:128000, gateSource:'',
+                mcpFilter:'', mcpErrors:false, mcpAuto:false, mcpEvents:[], mcpData:null };
+let mcpTimer = null;
+function stopMcpTimer(){ if(mcpTimer){ clearTimeout(mcpTimer); mcpTimer = null; } }
+
+function esc(s){
+  return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmt(n){ return n==null?'—':Number(n).toLocaleString('en-US'); }
+function pct(part,total){ return total>0 ? (part/total*100).toFixed(2)+'%' : '—'; }
+async function api(path){
+  const r = await fetch(path);
+  if(!r.ok){ throw new Error(path+' → HTTP '+r.status+' '+await r.text()); }
+  return r.json();
+}
+function fail(e){ view.innerHTML = '<div class="empty err">'+esc(e.message||e)+'</div>'; }
+
+// ── 页头：env/db 直接读 /health，与控制台同一真源 ──
+(async function boot(){
+  try{
+    const h = await api('/health');
+    const b = document.getElementById('envBadge');
+    b.textContent = 'env=' + (h.env || '?');
+    b.className = 'badge ' + (h.env === 'prod' ? 'prod' : 'local');
+    document.getElementById('dbBadge').textContent = 'db=' + (h.db || '(未标注)');
+  }catch(e){ document.getElementById('envBadge').textContent = 'env=? (health 不可达)'; }
+  // 深链：#ctx / #ctx/2393 / #convs / #docs —— 方便贴给人和截图
+  const h = decodeURIComponent(location.hash.slice(1));
+  if(h.startsWith('ctx/')) openCtx(Number(h.split('/')[1]));
+  else if(h) go(h);
+  else go('overview');
+})();
+
+document.querySelectorAll('nav a').forEach(a => a.onclick = () => go(a.dataset.v));
+function go(v){
+  state.v = v;
+  if(v !== 'mcp') stopMcpTimer();
+  document.querySelectorAll('nav a').forEach(a => a.classList.toggle('on', a.dataset.v === v));
+  if(v==='overview') renderOverview();
+  if(v==='convs') renderConvs();
+  if(v==='ctx') renderCtx();
+  if(v==='gate') renderGate();
+  if(v==='mcp') renderMcp();
+  if(v==='docs') renderDocs();
+}
+
+// ── 概览 ──
+async function renderOverview(){
+  view.innerHTML = '<div class="empty">载入中…</div>';
+  try{
+    const d = await api('/console/api/overview');
+    const m = d.data;
+    view.innerHTML = `
+      <h2>概览 · <span class="mono">${esc(d.db||'')}</span></h2>
+      <div class="metrics">
+        <div class="metric"><div class="k">会话</div><div class="v">${fmt(m.convs)}</div>
+          <div class="c">其中 dsh ${fmt(m.dsh_convs)}</div></div>
+        <div class="metric"><div class="k">消息</div><div class="v">${fmt(m.messages)}</div>
+          <div class="c">最后写入 ${esc(m.last_msg||'—')}</div></div>
+        <div class="metric"><div class="k">门控注入</div><div class="v">${fmt(m.gates)}</div>
+          <div class="c">最后一次 ${esc(m.last_gate||'—')}</div></div>
+        <div class="metric"><div class="k">上下文轨迹</div><div class="v">${fmt(m.ctx_traces)}</div>
+          <div class="c">ctx_trace 行数（采集端未接入）</div></div>
+        <div class="metric"><div class="k">记忆文档</div><div class="v">${fmt(m.docs)}</div>
+          <div class="c">doc</div></div>
+        <div class="metric"><div class="k">题库</div><div class="v">${fmt(m.quiz)}</div>
+          <div class="c">quiz_bank</div></div>
+      </div>
+      <div class="note"><b>数据现实：</b>「注入量」有真数据（gate_log ${fmt(m.gates)} 行）；
+        「上下文 token / 占比 / 压缩前后」无数据源——ctx_trace 至今 ${fmt(m.ctx_traces)} 行，
+        采集端（DSH 插件侧的余量/压缩观测）尚未实现。控制台已预留这几列，数据一到自动显示实测值。</div>`;
+  }catch(e){ fail(e); }
+}
+
+// ── 会话 ──
+async function renderConvs(q=''){
+  view.innerHTML = '<div class="empty">载入中…</div>';
+  try{
+    const d = await api('/console/api/convs?q='+encodeURIComponent(q)+'&limit=50&offset='+state.convOffset);
+    const rows = d.rows.map(r => `
+      <tr class="click" onclick="showConv('${esc(r.id).replace(/'/g,"\\'")}')">
+        <td class="mono">${esc(r.id)}</td>
+        <td>${esc(r.title||'')}</td>
+        <td>${esc(r.source||'')}</td>
+        <td class="num">${fmt(r.message_count)}</td>
+        <td class="muted mono">${esc(r.updated_at||'')}</td>
+      </tr>`).join('');
+    view.innerHTML = `
+      <h2>会话 · 共 ${fmt(d.total)}</h2>
+      <div class="row">
+        <input id="convQ" placeholder="按 id / 标题搜" value="${esc(q)}" style="width:340px">
+        <button onclick="state.convOffset=0;renderConvs(document.getElementById('convQ').value)">搜</button>
+        <button onclick="state.convOffset=0;document.getElementById('convQ').value='';renderConvs('')">清</button>
+      </div>
+      <table><thead><tr><th>会话 id</th><th>标题</th><th>来源</th><th class="num">消息</th><th>最后活动</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="5" class="muted">无</td></tr>'}</tbody></table>
+      <div class="pager">
+        <button ${state.convOffset===0?'disabled':''} onclick="state.convOffset=Math.max(0,state.convOffset-50);renderConvs(document.getElementById('convQ').value)">上一页</button>
+        <span>${state.convOffset+1}–${Math.min(state.convOffset+50,d.total)} / ${fmt(d.total)}</span>
+        <button ${state.convOffset+50>=d.total?'disabled':''} onclick="state.convOffset+=50;renderConvs(document.getElementById('convQ').value)">下一页</button>
+      </div>`;
+  }catch(e){ fail(e); }
+}
+
+async function showConv(id){
+  view.innerHTML = '<div class="empty">载入中…</div>';
+  try{
+    const d = await api('/console/api/conv?id='+encodeURIComponent(id));
+    const c = d.conv;
+    const gates = (d.gates||[]).map(g => `
+      <tr class="click" onclick="openCtx(${g.id})">
+        <td class="mono">#${g.id}</td><td>${esc(g.created_at)}</td><td>${esc(g.source)}</td>
+        <td class="num">${fmt(g.count)}</td><td class="num">${fmt(g.injected_chars)}</td>
+        <td class="num">${fmt(g.latency_ms)}</td><td>${esc(g.q)}</td>
+      </tr>`).join('');
+    const msgs = (d.messages||[]).map(m => `
+      <tr><td class="num">${m.seq}</td><td>${esc(m.role)}</td><td class="mono">${esc(m.created_at)}</td>
+      <td><pre style="margin:0;max-height:160px">${esc(m.text)}</pre></td></tr>`).join('');
+    view.innerHTML = `
+      <h2><a class="link" onclick="renderConvs()">← 会话</a> · ${esc(c.title||c.id)}</h2>
+      <div class="card"><div class="kv">
+        <div class="k">id</div><div class="v">${esc(c.id)}</div>
+        <div class="k">来源 / 模型</div><div class="v">${esc(c.source||'')} / ${esc(c.model||'')}</div>
+        <div class="k">消息数</div><div class="v">${fmt(c.message_count)}</div>
+        <div class="k">创建 / 更新</div><div class="v">${esc(c.created_at)} → ${esc(c.updated_at)}</div>
+      </div></div>
+      <h3>这个会话被门控注入过 ${d.gates.length} 次（点一行看这一轮注入了什么）</h3>
+      <table><thead><tr><th>#</th><th>时间</th><th>来源</th><th class="num">条数</th>
+        <th class="num">注入字符</th><th class="num">耗时ms</th><th>query 摘要</th></tr></thead>
+        <tbody>${gates || '<tr><td colspan="7" class="muted">无门控记录</td></tr>'}</tbody></table>
+      <h3>最近消息（倒序，正文截断 4000 字）</h3>
+      <table><thead><tr><th class="num">seq</th><th>role</th><th>时间</th><th>正文</th></tr></thead>
+      <tbody>${msgs || '<tr><td colspan="4" class="muted">无</td></tr>'}</tbody></table>`;
+  }catch(e){ fail(e); }
+}
+
+// ── 上下文（核心视图） ──
+async function renderCtx(){
+  view.innerHTML = '<div class="empty">载入中…</div>';
+  try{
+    const d = await api('/console/api/ctx?conversation_id='+encodeURIComponent(state.ctxConv)+'&limit=80&offset=0');
+    const rows = d.rows.map(r => `
+      <tr class="click" onclick="openCtx(${r.id})">
+        <td class="mono">#${r.id}</td>
+        <td class="mono">${esc(r.created_at)}</td>
+        <td class="mono">${esc((r.conversation_id||'').replace('dsh:session-','dsh:…'))}</td>
+        <td>${esc(r.source)}${r.bot?' / '+esc(r.bot):''}</td>
+        <td class="num">${fmt(r.count)}</td>
+        <td class="num">${fmt(r.injected_chars)}</td>
+        <td class="num">${fmt(Math.round((r.injected_chars||0)/1.7))}</td>
+        <td class="num">${fmt(r.latency_ms)}</td>
+        <td>${esc(r.q)}</td>
+      </tr>`).join('');
+    view.innerHTML = `
+      <h2>上下文 · 每一轮注入了什么（共 ${fmt(d.total)} 次注入）</h2>
+      <div class="note"><b>口径：</b>每一行 = 一次门控注入（gate_log）。<b>注入字符</b>是实测；
+        <b>token</b> 是估算（字符 ÷ 1.7，中文约 1.7 字符/token）；
+        <b>占比、压缩前后</b>要等 ctx_trace 有数据（现 0 行），点开详情里可以看到这两项的采集状态。
+        点任意一行 → 看这一轮具体注入了哪几条、前后对话是什么。</div>
+      <div class="row">
+        <input id="ctxConv" placeholder="按会话 id 过滤（留空=全部）" value="${esc(state.ctxConv)}" style="width:420px">
+        <button onclick="state.ctxConv=document.getElementById('ctxConv').value.trim();renderCtx()">过滤</button>
+        <button onclick="state.ctxConv='';renderCtx()">清</button>
+      </div>
+      <table><thead><tr><th>#</th><th>时间</th><th>会话</th><th>来源</th>
+        <th class="num">命中条数</th><th class="num">注入字符</th><th class="num">token(估)</th>
+        <th class="num">耗时ms</th><th>query</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="9" class="muted">无</td></tr>'}</tbody></table>`;
+  }catch(e){ fail(e); }
+}
+
+async function openCtx(id){
+  view.innerHTML = '<div class="empty">载入中…</div>';
+  try{
+    const d = await api('/console/api/ctx/detail?id='+id);
+    const g = d.gate;
+    const est = d.injected_tokens_est;
+    const limit = Number(document.getElementById('ctxLimitV')?.value || state.ctxLimit);
+    const comp = (d.ctx_traces||[]).length
+      ? `<pre>${esc(JSON.stringify(d.ctx_traces[0].compaction ?? null, null, 2))}</pre>`
+      : '<span class="muted">未采集（该会话 ctx_trace 无记录；全库共 '+d.ctx_trace_rows_in_db+' 行）</span>';
+    const hits = (d.hits||[]).map(h => `
+      <tr>
+        <td class="num">${h.n}</td>
+        <td><span class="tag ${esc(h.type)}">${esc(h.type)}</span></td>
+        <td>${esc(h.title)}</td>
+        <td class="mono muted">${esc(h.id)}</td>
+        <td class="num">${h.score==null?'—':Number(h.score).toFixed(4)}</td>
+      </tr>`).join('');
+    const around = (d.around||[]).map(m => `
+      <tr><td class="num">${m.seq}</td><td>${esc(m.role)}</td><td class="mono">${esc(m.created_at)}</td>
+      <td><pre style="margin:0;max-height:120px">${esc(m.text)}</pre></td></tr>`).join('');
+    view.innerHTML = `
+      <h2><a class="link" onclick="renderCtx()">← 上下文</a> · 注入 #${g.id}</h2>
+      <div class="row">
+        <input id="ctxLimitV" type="number" value="${state.ctxLimit}" style="width:130px"
+               oninput="state.ctxLimit=Number(this.value)||128000;document.getElementById('pctV').textContent='${'x'}'">
+        <span class="muted">上下文上限（token，人工设定；ctx_limit 未采集）</span>
+      </div>
+      <div class="metrics">
+        <div class="metric"><div class="k">注入字符（实测）</div><div class="v">${fmt(g.injected_chars)}</div></div>
+        <div class="metric"><div class="k">注入 token（估）</div><div class="v">${fmt(est)}</div>
+          <div class="c">字符 ÷ 1.7</div></div>
+        <div class="metric"><div class="k">占上下文上限</div>
+          <div class="v" id="pctV">${pct(est, state.ctxLimit)}</div>
+          <div class="c">分母为上方人工设定值</div></div>
+        <div class="metric"><div class="k">压缩前后</div><div class="v" style="font-size:14px">未采集</div>
+          <div class="c">ctx_trace ${d.ctx_trace_rows_in_db} 行</div></div>
+        <div class="metric"><div class="k">检索耗时</div><div class="v">${fmt(g.latency_ms)}<span class="muted" style="font-size:12px"> ms</span></div></div>
+      </div>
+      <div class="card" style="margin-top:12px"><div class="kv">
+        <div class="k">时间</div><div class="v">${esc(g.created_at)}</div>
+        <div class="k">会话</div><div class="v">${esc(g.conversation_id||'—')}</div>
+        <div class="k">来源 / bot</div><div class="v">${esc(g.source||'')}${g.bot?' / '+esc(g.bot):''}</div>
+        <div class="k">命中</div><div class="v">${fmt(g.count)} 条${g.injected_chars?'，注入 '+fmt(g.injected_chars)+' 字符':''}</div>
+        <div class="k">结果</div><div class="v">${g.ok?'<span class="ok">ok</span>':'<span class="err">失败：'+esc(g.error||'')+'</span>'}</div>
+        <div class="k">query</div><div class="v">${esc(g.query)}</div>
+      </div></div>
+      <h3>这一轮注入了什么（${(d.hits||[]).length} 条）</h3>
+      <table><thead><tr><th class="num">#</th><th>类型</th><th>标题</th><th>id</th><th class="num">分数</th></tr></thead>
+      <tbody>${hits || '<tr><td colspan="5" class="muted">无命中（空查询或检索失败）</td></tr>'}</tbody></table>
+      <h3>压缩记录</h3><div class="card">${comp}</div>
+      <h3>这一轮前后的对话（注入时刻前 2 分钟内的最近 6 条）</h3>
+      <table><thead><tr><th class="num">seq</th><th>role</th><th>时间</th><th>正文</th></tr></thead>
+      <tbody>${around || '<tr><td colspan="4" class="muted">无</td></tr>'}</tbody></table>`;
+    document.getElementById('ctxLimitV').oninput = function(){
+      state.ctxLimit = Number(this.value) || 128000;
+      document.getElementById('pctV').textContent = pct(est, state.ctxLimit);
+    };
+  }catch(e){ fail(e); }
+}
+
+// ── 门控日志 ──
+async function renderGate(){
+  view.innerHTML = '<div class="empty">载入中…</div>';
+  try{
+    const d = await api('/console/api/gate?source='+encodeURIComponent(state.gateSource)
+                        +'&limit=80&offset='+state.gateOffset);
+    const opts = (d.sources||[]).map(s =>
+      `<option value="${esc(s.source)}" ${s.source===state.gateSource?'selected':''}>${esc(s.source)} (${s.n})</option>`).join('');
+    const rows = d.rows.map(r => `
+      <tr class="click" onclick="openCtx(${r.id})">
+        <td class="mono">#${r.id}</td><td class="mono">${esc(r.created_at)}</td>
+        <td>${esc(r.source)}</td><td class="num">${fmt(r.count)}</td>
+        <td class="num">${fmt(r.injected_chars)}</td><td class="num">${fmt(r.latency_ms)}</td>
+        <td>${r.ok?'<span class="ok">ok</span>':'<span class="err">fail</span>'}</td>
+        <td>${esc(r.q)}</td>
+      </tr>`).join('');
+    view.innerHTML = `
+      <h2>门控日志 · 共 ${fmt(d.total)} 条</h2>
+      <div class="row">
+        <select onchange="state.gateSource=this.value;state.gateOffset=0;renderGate()">
+          <option value="">全部来源</option>${opts}
+        </select>
+        <span class="muted">点一行 → 注入明细</span>
+      </div>
+      <table><thead><tr><th>#</th><th>时间</th><th>来源</th><th class="num">条数</th>
+        <th class="num">注入字符</th><th class="num">耗时ms</th><th>结果</th><th>query</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="8" class="muted">无</td></tr>'}</tbody></table>
+      <div class="pager">
+        <button ${state.gateOffset===0?'disabled':''} onclick="state.gateOffset=Math.max(0,state.gateOffset-80);renderGate()">上一页</button>
+        <span>${state.gateOffset+1}–${Math.min(state.gateOffset+80,d.total)} / ${fmt(d.total)}</span>
+        <button ${state.gateOffset+80>=d.total?'disabled':''} onclick="state.gateOffset+=80;renderGate()">下一页</button>
+      </div>`;
+  }catch(e){ fail(e); }
+}
+
+// ── MCP 服务（谁连上来、调了什么） ──
+function fmtBytes(n){
+  n = Number(n||0);
+  if(n < 1024) return n + ' B';
+  if(n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+  return (n/1024/1024).toFixed(2) + ' MB';
+}
+function mcpKind(k){
+  return k==='session' ? '连接' : k==='tool' ? '调用' : k==='list' ? '工具列表' : (k||'—');
+}
+function mcpConfigText(d){
+  const cfg = { mcpServers: { 'zhishu-memory': { type:'streamableHttp', url:d.server.endpoint, disabled:false } } };
+  if(d.server.require_key){
+    cfg.mcpServers['zhishu-memory'].headers = { 'x-api-key':'zm_你的密钥' };
+  }
+  return JSON.stringify(cfg, null, 2);
+}
+async function renderMcp(){
+  stopMcpTimer();
+  view.innerHTML = '<div class="empty">载入中…</div>';
+  try{
+    const d = await api('/console/api/mcp?limit=300');
+    state.mcpData = d;
+    state.mcpEvents = d.events || [];
+    const s = d.server, m = d.summary, a = d.audit;
+    const rows = (d.clients||[]).map(c => `
+      <tr>
+        <td>${c.active ? '<span class="ok">在线</span>' : '<span class="muted">离线</span>'}</td>
+        <td>${esc(c.client)}${c.version?'<div class="muted mono">'+esc(c.version)+'</div>':''}</td>
+        <td>${esc(c.user_name||c.user||'—')}<div class="muted mono">${esc(c.key_fp||'(无 key)')}</div></td>
+        <td class="mono">${esc(c.ip||'—')}</td>
+        <td class="mono">${esc(c.first||'—')}</td>
+        <td class="mono">${esc(c.last||'—')}</td>
+        <td class="num">${fmt(c.sessions)}</td>
+        <td class="num">${fmt(c.calls)}${c.errors?' <span class="err">/'+fmt(c.errors)+' 错</span>':''}</td>
+        <td>${esc(c.last_tool||'—')}</td>
+      </tr>`).join('');
+    view.innerHTML = `
+      <h2>MCP 服务 · 连接与调用审计</h2>
+      <div class="note"><b>这是服务端视角：</b>每次客户端连上来会先 <span class="mono">initialize</span>
+        （记下客户端名/版本），再 <span class="mono">tools/list</span>，之后才是 <span class="mono">tools/call</span>。
+        成功与失败都记；密钥只记 <span class="mono">zm_</span> 开头的 8 位指纹，不记原文。
+        审计写在本机 JSONL，<b>库不可用时这一页照样能看</b>。</div>
+      <div class="metrics">
+        <div class="metric"><div class="k">24h 工具调用</div><div class="v">${fmt(m.calls_24h)}</div>
+          <div class="c">${m.errors_24h?'其中失败 '+fmt(m.errors_24h):'无失败'}</div></div>
+        <div class="metric"><div class="k">24h 连接</div><div class="v">${fmt(m.sessions_24h)}</div>
+          <div class="c">initialize 次数</div></div>
+        <div class="metric"><div class="k">客户端</div><div class="v">${fmt(m.clients)}</div>
+          <div class="c">在线 ${fmt(m.active)}（5 分钟内）</div></div>
+        <div class="metric"><div class="k">工具数</div><div class="v">${fmt(s.tools)}</div>
+          <div class="c">当前注册</div></div>
+      </div>
+      <div class="card" style="margin-top:12px"><div class="kv">
+        <div class="k">端点</div><div class="v">${esc(s.endpoint)}</div>
+        <div class="k">传输 / 鉴权</div><div class="v">${esc(s.transport)} · ${esc(s.auth)}
+          ${s.require_key?'（强制）':'（当前未强制，带 key 只影响身份与审计）'}</div>
+        <div class="k">服务实例</div><div class="v">env=${esc(s.env||'?')} · db=${esc(s.db||'(未标注)')}</div>
+        <div class="k">审计文件</div><div class="v">${esc(a.path)} · ${fmtBytes(a.bytes)}
+          · 保留 ${esc(a.retention)}${a.enabled?'':' · <span class="err">已关闭</span>'}</div>
+        <div class="k">统计口径</div><div class="v">最近 ${fmt(d.scan.kept)} 条事件${d.scan.capped?'（已达上限，旧事件未计入）':''}</div>
+      </div></div>
+      <details style="margin:12px 0">
+        <summary class="muted" style="cursor:pointer">给 WorkBuddy 的 mcp.json（点开复制）</summary>
+        <pre>${esc(mcpConfigText(d))}</pre>
+        <div class="muted" style="font-size:12.5px">WorkBuddy：插件 → MCP 服务器 → 配置 MCP，保存后重连；
+          也可以直接编辑 <span class="mono">~/.workbuddy/mcp.json</span>。Claude Code / Codex 同理。</div>
+      </details>
+      <h3>客户端（谁连上来了）</h3>
+      <table><thead><tr><th>状态</th><th>客户端</th><th>用户 / key</th><th>IP</th>
+        <th>首次</th><th>最后</th><th class="num">连接</th><th class="num">调用</th><th>最近工具</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="9" class="muted">还没有客户端连过。配置好 WorkBuddy 后，这里会出现它的 initialize 记录。</td></tr>'}</tbody></table>
+      <h3>连接与调用日志</h3>
+      <div class="row">
+        <input id="mcpQ" placeholder="按客户端 / 工具 / 参数 / key 过滤" value="${esc(state.mcpFilter)}" style="width:360px"
+               oninput="state.mcpFilter=this.value;renderMcpEvents()">
+        <label class="muted"><input type="checkbox" ${state.mcpErrors?'checked':''}
+               onchange="state.mcpErrors=this.checked;renderMcpEvents()" style="vertical-align:-2px"> 只看失败</label>
+        <span class="spacer"></span>
+        <label class="muted"><input type="checkbox" ${state.mcpAuto?'checked':''}
+               onchange="state.mcpAuto=this.checked;if(this.checked){renderMcp()}else{stopMcpTimer()}" style="vertical-align:-2px"> 自动刷新 15s</label>
+        <button onclick="renderMcp()">刷新</button>
+      </div>
+      <div id="mcpDetail"></div>
+      <table><thead><tr><th>时间</th><th>类型</th><th>客户端</th><th>工具 / 方法</th>
+        <th>结果</th><th class="num">耗时</th><th>摘要</th></tr></thead>
+      <tbody id="mcpRows"></tbody></table>
+      <div class="pager" id="mcpCount"></div>`;
+    renderMcpEvents();
+    if(state.mcpAuto) mcpTimer = setTimeout(() => { if(state.v==='mcp') renderMcp(); }, 15000);
+  }catch(e){ fail(e); }
+}
+function mcpFiltered(){
+  const q = (state.mcpFilter||'').trim().toLowerCase();
+  return state.mcpEvents.map((e,i)=>({e,i})).filter(({e}) => {
+    if(state.mcpErrors && e.ok !== false) return false;
+    if(!q) return true;
+    return [e.c,e.cv,e.tool,e.args,e.k,e.u,e.un,e.kf,e.ip].join(' ').toLowerCase().includes(q);
+  });
+}
+function renderMcpEvents(){
+  const body = document.getElementById('mcpRows');
+  if(!body) return;
+  const list = mcpFiltered();
+  body.innerHTML = list.slice(0,200).map(({e,i}) => {
+    const tool = e.k==='session' ? 'initialize' : e.k==='list' ? 'tools/list' : (e.tool||'—');
+    const summary = e.k==='session'
+      ? [e.u||'—', e.kf||'(无 key)', e.ip||''].join(' · ')
+      : e.k==='list' ? (fmt(e.tools)+' 个工具') : (e.args||'—');
+    return `
+      <tr class="click" onclick="openMcpEvent(${i})">
+        <td class="mono">${esc(e.t||'')}</td>
+        <td>${esc(mcpKind(e.k))}</td>
+        <td>${esc(e.c||'（未知）')}${e.cv?'<div class="muted mono">'+esc(e.cv)+'</div>':''}</td>
+        <td class="mono">${esc(tool)}</td>
+        <td>${e.ok===false?'<span class="err">失败</span>':'<span class="ok">ok</span>'}</td>
+        <td class="num">${fmt(e.d)}</td>
+        <td>${esc(summary)}</td>
+      </tr>`;
+  }).join('') || '<tr><td colspan="7" class="muted">没有匹配的事件</td></tr>';
+  document.getElementById('mcpCount').textContent =
+    `显示 ${Math.min(list.length,200)} / ${list.length} 条（共缓存 ${state.mcpEvents.length} 条）`;
+}
+function openMcpEvent(i){
+  const e = state.mcpEvents[i];
+  const box = document.getElementById('mcpDetail');
+  if(!e || !box) return;
+  box.innerHTML = `
+    <div class="card" style="border-color:#bcd0f7;background:#fbfdff">
+      <div class="kv">
+        <div class="k">时间 / 类型</div><div class="v">${esc(e.t)} · ${esc(mcpKind(e.k))}</div>
+        <div class="k">客户端</div><div class="v">${esc(e.c||'（未知）')} ${esc(e.cv||'')} ${e.pv?'（协议 '+esc(e.pv)+'）':''}</div>
+        <div class="k">用户 / key</div><div class="v">${esc(e.u||'—')} ${e.un?'('+esc(e.un)+')':''} · ${esc(e.kf||'(无 key)')} · ${esc(e.auth||'')}</div>
+        <div class="k">会话 / IP</div><div class="v">${esc(e.sid||'—')} · ${esc(e.ip||'—')}</div>
+        <div class="k">工具 / 参数</div><div class="v">${esc(e.tool||'—')}${e.args?' · '+esc(e.args):''}</div>
+        <div class="k">结果 / 耗时</div><div class="v">${e.ok===false?'失败：'+esc(e.e||'未知'):'ok'} · ${fmt(e.d)} ms</div>
+        <div class="k">UA</div><div class="v">${esc(e.ua||'—')}</div>
+      </div>
+      <pre style="max-height:220px">${esc(JSON.stringify(e,null,2))}</pre>
+      <button onclick="document.getElementById('mcpDetail').innerHTML=''">收起</button>
+    </div>`;
+  box.scrollIntoView({block:'nearest'});
+}
+
+// ── 记忆与题库 ──
+async function renderDocs(q='',kind=''){
+  view.innerHTML = '<div class="empty">载入中…</div>';
+  try{
+    const d = await api('/console/api/docs?q='+encodeURIComponent(q)+'&kind='+encodeURIComponent(kind)
+                        +'&limit=60&offset='+state.docOffset);
+    const kopt = (d.kinds||[]).map(k =>
+      `<option value="${esc(k.kind)}" ${k.kind===kind?'selected':''}>${esc(k.kind)} (${k.n})</option>`).join('');
+    const rows = d.rows.map(r => `
+      <tr class="click" onclick="openDoc('${esc(r.path).replace(/'/g,"\\'")}')">
+        <td><span class="tag">${esc(r.kind||'')}</span></td>
+        <td>${esc(r.title||'')}</td>
+        <td class="mono muted">${esc(r.path)}</td>
+        <td class="num">${fmt(r.body_len)}</td>
+        <td class="muted mono">${esc(r.updated_at||'')}</td>
+      </tr>`).join('');
+    view.innerHTML = `
+      <h2>记忆（doc）· 共 ${fmt(d.total)}</h2>
+      <div class="row">
+        <input id="docQ" placeholder="按 path / 标题搜" value="${esc(q)}" style="width:320px">
+        <select id="docK" onchange="state.docOffset=0;renderDocs(document.getElementById('docQ').value,this.value)">
+          <option value="">全部类型</option>${kopt}</select>
+        <button onclick="state.docOffset=0;renderDocs(document.getElementById('docQ').value,document.getElementById('docK').value)">搜</button>
+      </div>
+      <table><thead><tr><th>类型</th><th>标题</th><th>path</th><th class="num">字数</th><th>更新</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="5" class="muted">无</td></tr>'}</tbody></table>
+      <div class="pager">
+        <button ${state.docOffset===0?'disabled':''} onclick="state.docOffset=Math.max(0,state.docOffset-60);renderDocs(document.getElementById('docQ').value,document.getElementById('docK').value)">上一页</button>
+        <span>${state.docOffset+1}–${Math.min(state.docOffset+60,d.total)} / ${fmt(d.total)}</span>
+        <button ${state.docOffset+60>=d.total?'disabled':''} onclick="state.docOffset+=60;renderDocs(document.getElementById('docQ').value,document.getElementById('docK').value)">下一页</button>
+      </div>
+      <h3>题库（quiz_bank）</h3>
+      <div id="quizBox" class="empty">载入中…</div>`;
+    const q2 = await api('/console/api/quiz?limit=100');
+    const qr = q2.rows.map(r => `
+      <tr><td class="mono">${esc(r.qid)}</td><td>${esc(r.qtype)}</td>
+      <td>${esc(r.question)}</td><td>${esc(r.answer)}</td>
+      <td>${esc(r.difficulty)}</td><td>${r.active?'<span class="ok">启用</span>':'<span class="muted">停用</span>'}</td></tr>`).join('');
+    document.getElementById('quizBox').outerHTML =
+      `<table><thead><tr><th>qid</th><th>类型</th><th>题目</th><th>答案</th><th>难度</th><th>状态</th></tr></thead>
+       <tbody>${qr || '<tr><td colspan="6" class="muted">无</td></tr>'}</tbody></table>`;
+  }catch(e){ fail(e); }
+}
+
+async function openDoc(path){
+  view.innerHTML = '<div class="empty">载入中…</div>';
+  try{
+    const d = await api('/console/api/doc?path='+encodeURIComponent(path));
+    view.innerHTML = `
+      <h2><a class="link" onclick="renderDocs()">← 记忆</a> · ${esc(d.doc.title||d.doc.path)}</h2>
+      <div class="card"><div class="kv">
+        <div class="k">path</div><div class="v">${esc(d.doc.path)}</div>
+        <div class="k">kind</div><div class="v">${esc(d.doc.kind||'')}</div>
+        <div class="k">更新</div><div class="v">${esc(d.doc.updated_at)}</div>
+        <div class="k">字数</div><div class="v">${fmt(d.body_len)}${d.truncated?'（已截断 20000 字）':''}</div>
+      </div></div>
+      <pre>${esc(d.body)}</pre>`;
+  }catch(e){ fail(e); }
+}
+</script>
+</body>
+</html>

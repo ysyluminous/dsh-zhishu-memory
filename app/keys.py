@@ -28,7 +28,10 @@ SESSION_COOKIE = "zhishu_session"
 AUTH_VERIFY_URL = os.getenv(
     "AUTH_VERIFY_URL", "http://127.0.0.1:8080/api/auth/verify"
 )
-PUBLIC_MCP_URL = os.getenv("PUBLIC_MCP_URL", "http://127.0.0.1:8770/mcp")
+PUBLIC_MCP_URL = os.getenv(
+    "PUBLIC_MCP_URL",
+    f"http://127.0.0.1:{os.getenv('PORT', '41012')}/mcp",
+)
 
 
 def _connect() -> psycopg.Connection:

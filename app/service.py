@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import pathlib
 import re
 import time
 import uuid
@@ -12,6 +13,17 @@ from typing import Any
 
 import psycopg
 
+from . import history as _history
+from . import quality as _quality
+from . import core as _core
+from . import supersede as _supersede
+# 2026-11-18：Observation 写入模型 + 项目开工必读清单（账号主点名，参照 hindsight Observation）
+from . import observation as _observation
+from . import projects as _projects
+# 事项实体（2026-11-18）：事后聚类，挂在 remember 之后自己跑
+from . import issues as _issues
+# 统一可见性出口：谁被 supersede 只在这里算一次，查文档的地方统一带 hidden_param()
+from . import visibility as _visibility
 from .config import DEFAULT_USER, MEM_DSN, REQUIRE_KEY, ZHISHU_DSN
 
 
@@ -53,6 +65,64 @@ def _snippet(text: str, size: int = 320) -> str:
     clean = re.sub(r"<[^>]+>", " ", text or "")
     clean = re.sub(r"\s+", " ", clean).strip()
     return clean[:size]
+
+
+# 元笔记降权（2026-11-19 WorkBuddy 首次接入复盘）：
+# 查「伤寒论三家合参笔记.pdf」时，命中最多的是「关于 omnihist/记忆库本身」的技术笔记，
+# 正文里恰好引用了这个词；真正的业务会话反被压下去。
+# 只对 mem.doc 标题做降权，不动 mem.conv；MEM_META_PENALTY=1 可一键关掉。
+_META_TITLE_RE = re.compile(
+    r"(omnihist|记忆库|记忆服务|检索底座|检索层|mcp|workbuddy|会话采集|上下文编排|工作台)",
+    re.I,
+)
+_META_PENALTY = 0.55
+try:
+    _META_PENALTY = max(0.05, min(1.0, float(os.getenv("MEM_META_PENALTY", "0.55") or 0.55)))
+except (TypeError, ValueError):
+    pass
+
+
+def _is_meta_note(title: str, path: str = "") -> bool:
+    return bool(_META_TITLE_RE.search(f"{title or ''} {path or ''}"))
+
+
+def _match_info(terms: list[str], title: str, body: str, snippet: str) -> dict[str, Any]:
+    """回答「为什么这条被召回」：命中了哪些词、落在标题还是正文。"""
+    low_t = (title or "").lower()
+    low_b = (body or "").lower()
+    low_s = (snippet or "").lower()
+    title_hits = [t for t in terms if t and t.lower() in low_t]
+    body_hits = [t for t in terms if t and (t.lower() in low_b or t.lower() in low_s)]
+    return {
+        "matched_terms": list(dict.fromkeys(title_hits + body_hits))[:12],
+        "title_hits": list(dict.fromkeys(title_hits))[:8],
+        "body_hits": list(dict.fromkeys(body_hits))[:8],
+    }
+
+
+def _snippet_around(text: str, keyword: str, width: int = 160) -> str:
+    """关键词附近的片段，而不是从头截 320 字（会话消息常把关键词埋在中间）。"""
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    if not clean:
+        return ""
+    low = clean.lower()
+    key = (keyword or "").split()[0].lower() if (keyword or "").split() else ""
+    pos = low.find(key) if key else -1
+    if pos < 0:
+        return clean[:width * 2]
+    start = max(0, pos - width)
+    end = min(len(clean), pos + len(key) + width)
+    return ("…" if start else "") + clean[start:end] + ("…" if end < len(clean) else "")
+
+
+def _anchor(kind: str, ident: str, seq: int | None = None, at: str | None = None) -> str:
+    """可回溯锚点：doc 用路径；会话用 session + seq + 时间。"""
+    base = f"{kind}:{ident}"
+    if seq is not None:
+        base += f"#seq={seq}"
+    if at:
+        base += f"@{at}"
+    return base
 
 
 # 来源权重（2026-11-16 内容副总/幕后大佬定，只上这一条）：
@@ -283,50 +353,80 @@ def _personal_rows(
     score_conv, match_conv = _personal_score_and_match(
         "coalesce(snippet, '')", n_terms, op, weights=weights
     )
-    params = {**params, "incl_pending": bool(include_pending)}
+    params = _visibility.with_hidden({
+        **params,
+        "incl_pending": bool(include_pending),
+        "meta_re": _META_TITLE_RE.pattern,
+        "meta_pen": _META_PENALTY,
+    })
+    # 标题是元笔记（讲记忆库/检索/MCP 本身）→ 排序时降权，但不删除结果。
+    score_doc = (
+        f"({score_doc}) * (case when title ~* %(meta_re)s then %(meta_pen)s else 1.0 end)"
+    )
+    terms = [str(params.get(f"t{i}", "")) for i in range(n_terms)]
     rows: list[dict[str, Any]] = []
     cur.execute(
         f"""select path, kind, title, body, updated_at, {score_doc} as score
             from mem.doc
             where user_id = %(uid)s and ({match_doc})
               and (%(incl_pending)s or path not like '%%/pending/%%')
+              and path not like '%%/rejected/%%'
+              {_visibility.hidden_param()}
             order by score desc, updated_at desc limit %(lim)s""",
         params,
     )
     for row in cur.fetchall():
+        at = row[4].isoformat() if row[4] else None
+        info = _match_info(terms, row[2] or "", row[3] or "", _snippet(row[3]))
         rows.append({
             "scope": "personal",
+            "type": "doc",
             "source": "mem.doc",
             "kind": row[1],
             "id": row[0],
             "title": row[2] or "",
             "snippet": _snippet(row[3]),
-            "date": row[4].isoformat() if row[4] else None,
+            "date": at,
+            "at": at,
+            "last_synced_at": at,
+            "anchor": _anchor("mem.doc", row[0], at=at),
+            "meta": _is_meta_note(row[2] or "", row[0] or ""),
+            "match": info,
             "score": round(float(row[5]) * _DOC_SCORE_WEIGHT, 4),
         })
     cur.execute(
-        f"""select id, source, title, snippet, updated_at, {score_conv} as score
+        f"""select id, source, title, snippet, updated_at, message_count, {score_conv} as score
             from mem.conv
             where user_id = %(uid)s and ({match_conv})
+              and id <> all(%(sup)s)
             order by score desc, updated_at desc limit %(lim)s""",
         params,
     )
     for row in cur.fetchall():
+        at = row[4].isoformat() if row[4] else None
+        info = _match_info(terms, row[2] or "", row[3] or "", _snippet(row[3]))
         rows.append({
             "scope": "personal",
+            "type": "conversation",
             "source": "mem.conv",
             "kind": "conversation",
             "id": row[0],
+            "session": row[0],
             "title": row[2] or row[1],
             "snippet": _snippet(row[3] or ""),
-            "date": row[4].isoformat() if row[4] else None,
-            "score": round(float(row[5]), 4),
+            "date": at,
+            "at": at,
+            "last_synced_at": at,
+            "message_count": row[5],
+            "anchor": _anchor("mem.conv", row[0], at=at),
+            "match": info,
+            "score": round(float(row[6]), 4),
         })
     rows.sort(key=lambda x: (x.get("score") or 0.0, x.get("date") or ""), reverse=True)
     return rows[:limit]
 
 
-def search_personal(query: str, user_id: str, limit: int = 10) -> list[dict[str, Any]]:
+def search_personal(query: str, user_id: str, limit: int = 10, include_pending: bool = False) -> list[dict[str, Any]]:
     """个人检索：gram 模式按 IDF 加权覆盖度召回 + 加权排序；legacy 模式保持原行为。
 
     user_id 过滤是 SQL 硬条件，检索结果不会跨用户（隔离用例见 tests/test_search_isolation.py）。
@@ -335,7 +435,7 @@ def search_personal(query: str, user_id: str, limit: int = 10) -> list[dict[str,
     if not q:
         return []
     limit = max(1, min(limit, 50))
-    terms = _terms(q) or [q]
+    terms = _digit_variants(_expand_synonyms(_terms(q) or [q]), q)
     params: dict[str, Any] = {
         "uid": user_id,
         "lim": limit,
@@ -350,16 +450,16 @@ def search_personal(query: str, user_id: str, limit: int = 10) -> list[dict[str,
         with c.cursor() as cur:
             weights = _idf_weights(cur, user_id, len(terms), params) if gram_mode else None
             first_op = "cover" if gram_mode else "and"
-            out = _personal_rows(cur, params, len(terms), limit, first_op, weights)
+            out = _personal_rows(cur, params, len(terms), limit, first_op, weights, include_pending)
             if gram_mode and len(out) < 3 and len(terms) > 1:
                 # 召回不足时补一轮 OR 并合并（漏召回比排错更严重，宁可多给候选再精排）
-                extra = _personal_rows(cur, params, len(terms), limit, "or", weights)
+                extra = _personal_rows(cur, params, len(terms), limit, "or", weights, include_pending)
                 seen = {r.get("id") for r in out}
                 out += [r for r in extra if r.get("id") not in seen]
                 out.sort(key=lambda x: (x.get("score") or 0.0, x.get("date") or ""), reverse=True)
                 out = out[:limit]
             if not out and len(terms) > 1:
-                out = _personal_rows(cur, params, len(terms), limit, "or", weights)
+                out = _personal_rows(cur, params, len(terms), limit, "or", weights, include_pending)
     return out
 
 
@@ -383,6 +483,7 @@ def search_public(query: str, limit: int = 10) -> list[dict[str, Any]]:
     return [
         {
             "scope": "public",
+            "type": "public_doc",
             "source": row[1],
             "id": row[0],
             "title": row[2] or "",
@@ -393,36 +494,273 @@ def search_public(query: str, limit: int = 10) -> list[dict[str, Any]]:
     ]
 
 
-def search(query: str, user_id: str, limit: int = 10, scope: str = "auto") -> dict[str, Any]:
+def search(query: str, user_id: str, limit: int = 10, scope: str = "auto", include_pending: bool = False,
+           include_conversations: bool = True) -> dict[str, Any]:
     scope = (scope or "auto").lower()
     limit = max(1, min(limit, 50))
     if scope == "personal":
-        results = search_personal(query, user_id, limit)
+        results = search_personal(query, user_id, limit, include_pending)
     elif scope == "public":
         results = search_public(query, limit)
     else:
-        personal = search_personal(query, user_id, limit)
+        personal = search_personal(query, user_id, limit, include_pending)
         public = search_public(query, limit)
         results = (personal + public)[:limit]
-    return {"query": query, "scope": scope, "results": results, "count": len(results)}
+
+    # P0（2026-11-19）：文档/会话元数据常常只沾到 query 里的一两个词，
+    # 真正「聊过这件事」的会话在 13 万条消息里。单独给一栏会话命中，
+    # 不挤占 results 的排序，客户端也不会再被迫跳出 MCP 去 grep。
+    conversation_hits: list[dict[str, Any]] = []
+    if include_conversations and scope != "public" and len((query or "").strip()) >= 2:
+        try:
+            conversation_hits = conv_search(
+                query, user_id=user_id, limit=5, context=0
+            ).get("matches", [])
+        except Exception:
+            conversation_hits = []
+    return {
+        "query": query,
+        "scope": scope,
+        "results": results,
+        "count": len(results),
+        "conversation_hits": conversation_hits,
+        "hints": [
+            "results 里 type=doc 的用 id（path）按需取正文；type=conversation 的用 conv_search 在会话内定位。",
+            "conversation_hits 是消息级命中，带 session/seq/at/anchor，可直接用 conv_get 取上下文。",
+            "只想要某一条会话的全文时用 conv_get(compact=True)；不要整段导出再本地 grep。",
+        ],
+    }
 
 
-def remember(user_id: str, text: str, kind: str = "event", title: str = "", topics: str = "") -> dict[str, Any]:
+_HELP_GUIDE: dict[str, Any] = {
+    "purpose": "跨 AI 协作的记忆检索底座：先选对工具，再取最小够用的上下文。",
+    "tools": {
+        "search": {
+            "when": "不知道在哪，先做全局检索；返回文档/会话元数据 + conversation_hits（消息级命中）。",
+            "example": 'search(query="伤寒论三家合参笔记.pdf", limit=10)',
+            "notes": "results[].type=doc|conversation；conversation_hits[] 带 session/seq/at/anchor。",
+        },
+        "conv_search": {
+            "when": "已知大概在某条会话，或 search 的 conversation_hits 命中了，做会话内关键词定位。",
+            "example": 'conv_search(keyword="三家合参", conv_id="dsh:session-...", limit=20, context=1)',
+            "notes": "返回 seq/role/at/snippet/context/anchor；不跨 user_id。",
+        },
+        "conv_list": {
+            "when": "先按时间窗/source 找会话，不知道关键词时用。",
+            "example": 'conv_list(since="7d", source="workbuddy", limit=20)',
+        },
+        "conv_get": {
+            "when": "已知 conv_id，要读原文；先 compact=True 看轮廓，再按 seq 取局部。",
+            "example": 'conv_get(conv_id="...", compact=True, limit=100)',
+            "notes": "keyword 可在会话内过滤；返回 last_synced_at / sync_status / anchor。",
+        },
+        "gate": {
+            "when": "回答前强制取回相关上下文；DSH 插件每轮自动调用。",
+            "example": 'gate(query="...", source="dsh", conversation_id="...")',
+        },
+        "remember": {
+            "when": "写入结论/决策；带 anchor（文件:行号 / session / 命令原文）便于以后溯源。",
+            "example": 'remember(text="...", kind="decision", anchor="session-...")',
+        },
+        "pending": {
+            "when": "看待审积压有多少条、最老一条多久。",
+        },
+        "doc_history": {
+            "when": "查某条记忆的变更时间线（append-only + hash chain）。",
+        },
+        "feedback": {
+            "when": "记录这条记忆是否有用；可选 0-5 分项评分。",
+        },
+    },
+    "order": ["search → conversation_hits", "conv_search (定位)", "conv_get (compact → 局部)"],
+}
+
+
+def help_text(topic: str = "") -> dict[str, Any]:
+    """工具选型引导；topic 可传 search / conversation / write / review，留空给全量。"""
+    key = (topic or "").strip().lower()
+    if not key:
+        return {"ok": True, **_HELP_GUIDE}
+    aliases = {
+        "search": ["search", "conv_search", "conv_list", "conv_get"],
+        "conversation": ["search", "conv_search", "conv_list", "conv_get"],
+        "write": ["remember", "pending"],
+        "review": ["pending", "doc_history", "feedback"],
+    }
+    names = aliases.get(key)
+    if not names:
+        return {"ok": False, "error": f"未知 topic：{topic}", "topics": sorted(aliases)}
+    return {
+        "ok": True,
+        "topic": key,
+        "tools": {name: _HELP_GUIDE["tools"].get(name, {}) for name in names},
+        "order": _HELP_GUIDE["order"],
+    }
+
+
+def capabilities() -> dict[str, Any]:
+    """给客户端做工具选型用的能力清单（不依赖库，永远可用）。"""
+    return {
+        "ok": True,
+        "server": "zhishu-memory",
+        "transport": "MCP streamable HTTP + REST mirror",
+        "tools": sorted(_HELP_GUIDE["tools"]),
+        "retrieval": {
+            "search": "docs + conversation metadata + conversation_hits (message-level)",
+            "conv_search": "keyword search inside one/all conversations, returns anchors",
+            "conv_get": "transcript with compact/keyword/last_synced_at",
+        },
+        "identity": "x-api-key；未开 REQUIRE_KEY 时落到 MEM_DEFAULT_USER",
+        "help": "help(topic='search'|'conversation'|'write'|'review')",
+    }
+
+# ---------------- 写入幂等键（2026-11-18 老大定） ----------------
+# 为什么必须有：客户端超时会重试（今早实测一次 30s 超时重试，`书页优点对表` 落了两条 event），
+# 重复 event 会直接污染退化检查（duplicate_facts 误报）、让同一事项挂出一堆重复 links——
+# 正是我们在防的「越用越烂」。所以：同一个键 30 分钟内视为重复，直接返回已存 id，不再写行。
+_IDEM_PATH = pathlib.Path(__file__).resolve().parents[2] / "data" / "audit" / "idem.jsonl"
+IDEM_TTL_SECONDS = 30 * 60
+
+
+def _idem_key(idem_key: str, source: str, conversation_id: str, body: str) -> str:
+    """显式键优先；没给就按 (source, conversation_id, 文本 hash) 算——客户端不用改也能幂等。"""
+    explicit = (idem_key or "").strip()
+    if explicit:
+        return explicit[:200]
+    raw = f"{source or 'session'}|{conversation_id or ''}|{body or ''}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+def _idem_lookup(key: str) -> dict[str, Any] | None:
+    """查 30 分钟内的同键命中；返回 {doc_id, age_seconds} 或 None。event 流水也走这条。"""
+    if not _IDEM_PATH.exists() or not key:
+        return None
+    now = time.time()
+    hit = None
+    for line in _IDEM_PATH.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get("key") != key:
+            continue
+        try:
+            age = now - datetime.fromisoformat(str(rec.get("ts")).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        if 0 <= age <= IDEM_TTL_SECONDS:
+            hit = {"doc_id": rec.get("doc_id"), "age_seconds": round(age, 1),
+                   "first_ts": rec.get("ts")}
+    return hit
+
+
+def _idem_record(key: str, doc_id: str) -> None:
+    try:
+        _IDEM_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _IDEM_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(),
+                                 "key": key, "doc_id": doc_id}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass          # 幂等登记失败不能连累写入本身
+
+
+def remember(user_id: str, text: str, kind: str = "event", title: str = "", topics: str = "",
+             source: str = "", anchor: str = "", supersedes: str = "",
+             force_new: bool = False, idem_key: str = "",
+             conversation_id: str = "") -> dict[str, Any]:
     body = (text or "").strip()
     if not body:
         raise ValueError("内容不能为空")
+    # 幂等：同键 30 分钟内重复请求 → 直接返回已存 id，不写文档、不写 Observation、不挂事项。
+    idem = _idem_key(idem_key, source, conversation_id, body)
+    hit = _idem_lookup(idem)
+    if hit:
+        return {"ok": True, "id": hit["doc_id"], "idem": "hit", "idem_key": idem,
+                "age_seconds": hit["age_seconds"], "deduped": True,
+                "observation": {}, "issue": {},
+                "note": f"同键 {IDEM_TTL_SECONDS // 60} 分钟内已写过，直接命中已存记录"}
     kind = (kind or "event").strip().lower()
-    if kind not in {"event", "decision", "artifact", "entity", "belief", "metric"}:
-        kind = "event"
+    # v1 review-gated：不再静默把未知 kind 降级成 event（今天踩过「新造类型被悄悄改掉」），
+    # 原样保留，交给 review 的白名单去拦。
     first = body.splitlines()[0].strip().lstrip("#").strip()
     title = (title or first)[:120]
     topic_list = [t.strip() for t in (topics or "").split(",") if t.strip()]
     digest = hashlib.sha256(body.encode()).hexdigest()
     day = datetime.now().strftime("%Y%m%d")
-    path = f"cloud/{user_id}/{day}-{digest[:8]}.md"
+    # v1 review-gated：path 就是状态（零 DDL）。
+    #
+    # v1.6 豁免（2026-11-17 幕后大佬定）：**所有 kind=event 一律直接入库，不进 pending**。
+    # 为什么放宽：event 是「发生了什么」＝事实记录，不构成「该怎么做」，不会误导判断；
+    #   decision/artifact/belief/metric/entity 才是结论，会改变判断，闸必须留。
+    # 为什么废掉 title~^session- 那条：原来只豁免插件自动摘要，结果所有交付回执、验收记录、
+    #   踩坑日志都进 pending（今天 26 条、昨晚 16 条），审的人只能 force 硬过 —— 闸门形同虚设。
+    #   用「标题前缀」当判据本来就是启发式（今天第三次栽在这类启发式上），改成按 kind 分。
+    auto_writeback = kind == "event"
+    path_dir = f"cloud/{user_id}" if auto_writeback else f"cloud/{user_id}/pending"
+    path = f"{path_dir}/{day}-{digest[:8]}.md"
+
+    # Observation 写入前判定（2026-11-18，账号主指定语义）：
+    # 先决定「新建 / 补证据 / 更正 / 不动」，再决定要不要落 mem.doc。
+    # 判定在写入前做，不是写进去再合并——同一条事实写第二次不应该多出一行。
+    statement = (title or first)[:200]
+    # Observation 只接「结论类」写入（decision/artifact/belief/metric/entity）。
+    # 为什么 event 不走：event 是「发生了什么」的流水，标题常是同一句开场（「收到」「补写」），
+    # 按相似度判重会把两条不同的事静默折成一条——那是比遗忘更严重的丢历史。
+    # 结论类才会出现「同一条事实反复写」和「旧结论被推翻」，正是这次要治的病。
+    obs_kinds = {"decision", "artifact", "belief", "metric", "entity"}
+    decision = None
+    if kind in obs_kinds:
+        # 接替一条「Observation 模型之前」写的老文档：先按 mem.doc 现状懒回填一行，
+        # 否则 supersedes 会指向不存在的 Observation（线上 3065 条历史文档都是这种）。
+        if supersedes and supersedes not in _observation.load(user_id):
+            legacy = _doc_meta(supersedes, user_id)
+            if legacy:
+                _observation.backfill(supersedes, legacy["title"], legacy["kind"], user_id,
+                                      ts=legacy["updated_at"])
+        decision = _observation.decide(
+            statement=statement, kind=kind, user_id=user_id, obs_id=path,
+            evidence=[{
+                "source": source or "session",
+                "anchor": anchor,
+                "note": body[:160],
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }],
+            supersedes=supersedes, force_new=force_new,
+        )
+    obs_out = {k: decision.get(k) for k in
+               ("action", "status", "statement", "evidence_count", "similarity",
+                "supersedes", "reason") if decision and decision.get(k) is not None}
+    if decision is not None and not decision.get("doc_should_write"):
+        # evidence / noop：已有 Observation 吸收这次信息，不新增文档行（行数不变）。
+        _idem_record(idem, decision["obs_id"])
+        return {"ok": True, "id": decision["obs_id"], "kind": decision["kind"],
+                "title": title, "topics": topic_list, "observation": obs_out,
+                "idem": "miss", "idem_key": idem,
+                "deduped": True, "auto_approved": False}
 
     with _conn(MEM_DSN) as c:
         with c.cursor() as cur:
+            # P4 词法去重（零 DDL）：先跟正式区最近 200 条比 3-gram Jaccard，>=0.62 判重不写。
+            # 默认关闭（MEM_DEDUPE=on 才启用）：今晚只交付 P3，P4 等明早评审后再开闸。
+            dedupe_on = os.environ.get("MEM_DEDUPE", "off").strip().lower() in ("1", "on", "true", "yes")
+            cur.execute(
+                f"select path, body from mem.doc where user_id=%(uid)s "
+                f"and path not like '%%/pending/%%' and path not like '%%/rejected/%%' "
+                f"{_visibility.hidden_param()} order by updated_at desc limit 200",
+                _visibility.with_hidden({"uid": user_id}),
+            )
+            best_id, best_score = None, 0.0
+            for cand_path, cand_body in (cur.fetchall() if dedupe_on else []):
+                s = _quality.jaccard(body, cand_body or "")
+                if s > best_score:
+                    best_id, best_score = cand_path, s
+            if best_id and best_score >= 0.62:
+                return {"ok": True, "deduped": True, "similar_to": best_id,
+                        "score": round(best_score, 4), "id": best_id}
+            cur.execute("select hash, length(body) from mem.doc where path=%s", (path,))
+            prev_row = cur.fetchone()
             cur.execute(
                 """insert into mem.doc (path, kind, title, body, hash, updated_at, user_id)
                    values (%s,%s,%s,%s,%s,now(),%s)
@@ -446,7 +784,47 @@ def remember(user_id: str, text: str, kind: str = "event", title: str = "", topi
                     (path, tid, user_id),
                 )
         c.commit()
-    return {"ok": True, "id": path, "kind": kind, "title": title, "topics": topic_list}
+    _history.add(path, "update" if prev_row else "create",
+                 "auto" if auto_writeback else "user",
+                 old_hash=(prev_row[0] if prev_row else ""), new_hash=digest,
+                 old_len=(prev_row[1] if prev_row else None), new_len=len(body),
+                 reason=("write-back 摘要豁免" if auto_writeback else ""))
+    if auto_writeback:
+        # 豁免必须留痕：每天早上要能数出「昨天自动通过了几条」，否则这条豁免就是法外之地。
+        _review_log({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "id": path,
+            "kind": kind,
+            "title": title,
+            "decision": "auto_pass",
+            "auto": True,
+            "reason": "write-back 摘要豁免（kind=event 且 title~^session-）：v1.5 临时方案，v2 改显式 auto_approved 参数",
+        })
+    # 事后聚类（2026-11-18）：写完就自己找事项，挂不上记 orphan，绝不打断写入、绝不反问。
+    assign: dict[str, Any] = {}
+    try:
+        assign = _issues.auto_assign(path, title, body, kind)
+    except Exception as exc:
+        assign = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    _idem_record(idem, path)
+    return {"ok": True, "id": path, "kind": kind, "title": title, "topics": topic_list,
+            "observation": obs_out, "issue": assign, "idem": "miss", "idem_key": idem,
+            "auto_approved": auto_writeback}
+
+
+def _doc_meta(path: str, user_id: str) -> dict[str, str] | None:
+    """取一条老文档的标题/类型/更新时间，用于 Observation 懒回填。"""
+    with _conn(MEM_DSN) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "select title, kind, updated_at from mem.doc where user_id=%s and path=%s",
+                (user_id, path),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return {"title": row[0] or "", "kind": row[1] or "event",
+            "updated_at": row[2].isoformat() if row[2] else ""}
 
 
 def whoami(user_id: str) -> dict[str, Any]:
@@ -458,6 +836,12 @@ def whoami(user_id: str) -> dict[str, Any]:
 
 
 def stats(user_id: str) -> dict[str, Any]:
+    out = _stats_core(user_id)
+    out["feedback_7d"] = _quality.feedback_stats(7)
+    return out
+
+
+def _stats_core(user_id: str) -> dict[str, Any]:
     with _conn(MEM_DSN) as c:
         with c.cursor() as cur:
             cur.execute("select count(*) from mem.doc where user_id = %s", (user_id,))
@@ -608,6 +992,11 @@ def idea_steps(user_id: str, idea_id: str) -> dict:
 
 
 def idea_to_todos(user_id: str, idea_id: str) -> dict:
+    """思路步骤转待办：**统一写 growth.time_entry（经 todo_store）**，不再写 mem.todo。
+
+    2026-11-18 老大定：mem.todo 是遗留表，第三个"待办"会造成数据分裂——
+    MCP todo 工具早就改到 growth.time_entry 了，这里单独写 mem.todo 等于再开一个源。
+    """
     with _conn(MEM_DSN) as c:
         with c.cursor() as cur:
             cur.execute(
@@ -616,16 +1005,17 @@ def idea_to_todos(user_id: str, idea_id: str) -> dict:
                 (idea_id, user_id),
             )
             rows = cur.fetchall()
-            created = []
-            for step_id, title in rows:
-                tid = _new_id()
-                cur.execute(
-                    """insert into mem.todo (id,user_id,title,status,priority,source)
-                       values (%s,%s,%s,'pending',2,%s)""",
-                    (tid, user_id, title, f"idea:{idea_id}:{step_id}"),
-                )
-                created.append(tid)
-        c.commit()
+    created = []
+    for step_id, title in rows:
+        res = _todo_store.todo_add(
+            user_id,
+            title=title,
+            detail="来自思路 " + str(idea_id) + " 的步骤 " + str(step_id),
+            priority=2,
+            source="idea:" + str(idea_id) + ":" + str(step_id),
+            owner="ai",
+        )
+        created.append(res.get("id"))
     return {"ok": True, "created": len(created), "todo_ids": created}
 
 
@@ -640,6 +1030,11 @@ def todo_add(user_id: str, title: str, detail: str = "", due_at: str = "",
 
 def todo_list(user_id: str, status: str = "", limit: int = 50) -> dict:
     return _todo_store.todo_list(user_id, status, limit)
+
+
+def todo_query(user_id: str, status: str = "", owner: str = "", priority: int | None = None,
+               project: str = "", limit: int = 100) -> dict:
+    return _todo_store.todo_query(user_id, status, owner, priority, project, limit)
 
 
 def todo_update(user_id: str, todo_id: str, status: str = "", title: str = "",
@@ -774,6 +1169,8 @@ def related(user_id: str, node_id: str, depth: int = 1, limit: int = 20) -> dict
             for item in found:
                 item["title"] = titles.get(item["id"], "")
                 item["kind"] = kinds.get(item["id"], "")
+    # 统一可见性：被 supersede 的旧条不许以「相关记忆」的身份回来（改口径后还在推旧口径）。
+    found = [f for f in found if _visibility.is_visible(str(f.get("id") or ""))]
     return {"node_id": node_id, "depth": depth, "count": len(found), "related": found}
 
 
@@ -1037,7 +1434,7 @@ def prompt_get(key: str, version: int | None = None) -> dict:
                 cur.execute("select key,version,source_type,title,description,template,output_schema,model,temperature from mem.prompt_template where key=%s order by version desc limit 1", (key,))
             row = cur.fetchone()
     if not row:
-        raise ValueError("????????")
+        raise ValueError("内容不能为空")
     return {"key": row[0], "version": row[1], "source_type": row[2], "title": row[3],
             "description": row[4], "template": row[5], "output_schema": row[6],
             "model": row[7], "temperature": float(row[8]) if row[8] is not None else None}
@@ -1100,6 +1497,8 @@ def conv_list(since: str = "24h", until: str = "", source: str = "", limit: int 
     sql = """select c.id,c.source,c.title,c.updated_at,
                     c.message_count + (select count(*) from mem.live_event l
                        where l.conversation_id=c.id and l.reconciled_at is null) mc,
+                    (select count(*) from mem.live_event l
+                       where l.conversation_id=c.id and l.reconciled_at is null) unrec,
                     coalesce((select l.text from mem.live_event l
                        where l.conversation_id=c.id and l.reconciled_at is null and l.role='user'
                        order by l.created_at desc limit 1), c.snippet) last_user
@@ -1119,19 +1518,26 @@ def conv_list(since: str = "24h", until: str = "", source: str = "", limit: int 
             rows = cur.fetchall()
     out = []
     for r in rows:
+        updated = r[3].astimezone().isoformat() if r[3] else None
         out.append({"id": r[0], "source": r[1], "title": r[2] or "",
-                    "updated_at": r[3].astimezone().isoformat() if r[3] else None,
+                    "updated_at": updated,
+                    "last_synced_at": updated,
                     "message_count": r[4],
-                    "last_user": (r[5] or "")[:300]})
+                    "unreconciled": r[5],
+                    "sync_status": "live" if r[5] else "reconciled",
+                    "last_user": (r[6] or "")[:300]})
     return {"count": len(out), "conversations": out}
 
 
 def conv_get(conv_id: str, since: str = "", until: str = "", limit: int = 100,
-             offset: int = 0) -> dict:
+             offset: int = 0, compact: bool = False, keyword: str = "",
+             max_chars: int = 20000) -> dict:
     start = _ms(since, None)
     end = _ms(until, None)
     limit = max(1, min(int(limit), 500))
     offset = max(0, int(offset))
+    max_chars = max(200, min(int(max_chars), 100000))
+    kw = (keyword or "").strip()
     conds = []
     args: list = [conv_id]
     if start:
@@ -1140,13 +1546,16 @@ def conv_get(conv_id: str, since: str = "", until: str = "", limit: int = 100,
     if end:
         conds.append("created_at <= to_timestamp(%s)")
         args.append(end / 1000.0)
+    if kw:
+        conds.append("text ilike %s")
+        args.append(_like(kw))
     extra = (" and " + " and ".join(conds)) if conds else ""
     with _conn(MEM_DSN) as c:
         with c.cursor() as cur:
             cur.execute("select id,source,title,updated_at from mem.conv where id=%s", (conv_id,))
             meta = cur.fetchone()
             if not meta:
-                raise ValueError("?????")
+                raise ValueError("参数不合法")
             cur.execute(
                 f"""select
                       (select count(*) from mem.conv_message where conversation_id=%s{extra})
@@ -1156,27 +1565,256 @@ def conv_get(conv_id: str, since: str = "", until: str = "", limit: int = 100,
             )
             total = int(cur.fetchone()[0])
             cur.execute(
-                f"""select seq,role,created_at,text from (
-                      select seq,role,created_at,text,omni_id ord
+                f"""select seq,role,created_at,text,synced_at from (
+                      select seq,role,created_at,text,synced_at,omni_id ord
                       from mem.conv_message where conversation_id=%s{extra}
                       union all
-                      select seq,role,created_at,text,id ord
+                      select seq,role,created_at,text,received_at as synced_at,id ord
                       from mem.live_event
                       where conversation_id=%s and reconciled_at is null{extra}
                     ) u order by seq asc, created_at asc, ord asc limit %s offset %s""",
                 [conv_id, *args[1:], conv_id, *args[1:], limit, offset],
             )
             rows = cur.fetchall()
+            cur.execute(
+                """select
+                     (select max(synced_at) from mem.conv_message where conversation_id=%s),
+                     (select max(received_at) from mem.live_event
+                        where conversation_id=%s and reconciled_at is null),
+                     (select count(*) from mem.live_event
+                        where conversation_id=%s and reconciled_at is null)""",
+                (conv_id, conv_id, conv_id),
+            )
+            synced_seen, live_seen, unreconciled = cur.fetchone()
+    stamps = [s for s in (synced_seen, live_seen, meta[3]) if s]
+    last_synced = max(stamps).astimezone().isoformat() if stamps else None
     messages = []
     for r in rows:
         text = r[3] or ""
-        messages.append({"seq": r[0], "role": r[1],
-                         "at": r[2].astimezone().isoformat() if r[2] else None,
-                         "text": text[:20000], "truncated": len(text) > 20000})
+        at = r[2].astimezone().isoformat() if r[2] else None
+        chars = len(text)
+        shown = text
+        if compact:
+            shown = _snippet_around(text, kw, 140) if kw else _snippet(text, 320)
+        else:
+            shown = text[:max_chars]
+        messages.append({
+            "seq": r[0],
+            "role": r[1],
+            "at": at,
+            "text": shown,
+            "chars": chars,
+            "truncated": chars > len(shown),
+            "synced_at": r[4].astimezone().isoformat() if r[4] else None,
+            "anchor": _anchor("mem.conv", conv_id, r[0], at),
+        })
     return {"id": meta[0], "source": meta[1], "title": meta[2] or "",
             "updated_at": meta[3].astimezone().isoformat() if meta[3] else None,
+            "last_synced_at": last_synced,
+            "sync_status": "live" if unreconciled else "reconciled",
+            "unreconciled": unreconciled,
+            "keyword": kw, "compact": bool(compact), "max_chars": max_chars,
             "total": total, "offset": offset, "returned": len(messages),
             "backend": "pg", "messages": messages}
+
+
+def _conv_terms(keyword: str, cap: int = 12) -> list[str]:
+    """会话内检索词：整串优先，再补 4-gram。
+
+    为什么不是 2-gram：pg_trgm 的 GIN 索引至少要 3 个字符才能抽 trigram；
+    2 字词只能全表扫（实测「三家」7s、「合参」11s）。4-gram 既能吃索引，
+    又能覆盖「伤寒论三家合参笔记」里真正的「三家合参」。
+    """
+    raw = (keyword or "").strip()
+    if not raw:
+        return []
+    out: list[str] = []
+    for candidate in (raw, re.sub(r"\.(?:pdf|md|docx?|xlsx?|pptx?|txt)$", "", raw, flags=re.I)):
+        if candidate and len(candidate) >= 2 and candidate not in out:
+            out.append(candidate)
+    for part in _TERM_SPLIT.split(raw):
+        if len(part) >= 3 and part not in out:
+            out.append(part)
+    for run in _CJK_RUN.findall(raw):
+        if len(run) <= 3:
+            if len(run) == 3 and run not in out:
+                out.append(run)
+            continue
+        for i in range(len(run) - 3):
+            gram = run[i:i + 4]
+            if gram not in out:
+                out.append(gram)
+    return out[:cap]
+
+
+def conv_search(keyword: str, conv_id: str = "", since: str = "", until: str = "",
+                limit: int = 20, context: int = 1, user_id: str = "owner") -> dict:
+    """会话内关键词检索：返回 seq/role/at/上下文/片段，可直接定位到某条消息。
+
+    P0（2026-11-19 WorkBuddy 首次接入）：之前只能 conv_get 整段翻页，5157 条消息
+    找关键决策要导出 3MB+ 再本地 grep。这里按 user_id 隔离，不跨用户。
+    """
+    kw = (keyword or "").strip()
+    if not kw:
+        raise ValueError("keyword 不能为空")
+    limit = max(1, min(int(limit), 50))
+    context = max(0, min(int(context), 3))
+    start = _ms(since, None)
+    end = _ms(until, None)
+    terms = _conv_terms(kw)
+    if not terms:
+        return {"keyword": kw, "count": 0, "matches": [], "conversations": [], "hint": "keyword 不能为空"}
+
+    base_where = ["c.user_id = %s"]
+    base_args: list[Any] = [user_id]
+    if conv_id:
+        base_where.append("m.conversation_id = %s")
+        base_args.append(conv_id)
+    if start:
+        base_where.append("m.created_at >= to_timestamp(%s)")
+        base_args.append(start / 1000.0)
+    if end:
+        base_where.append("m.created_at <= to_timestamp(%s)")
+        base_args.append(end / 1000.0)
+
+    # 每个词单独查（单 pattern 才能吃到 trgm GIN 索引；OR 多词会让 PG 退化成 seq scan，
+    # 实测 26s → 单 pattern 0.1s）。合并去重后在 Python 里按命中词数精排。
+    seen: dict[tuple[Any, ...], dict[str, Any]] = {}
+    with _conn(MEM_DSN) as c:
+        with c.cursor() as cur:
+            for term in terms:
+                where = [*base_where, "m.text ilike %s"]
+                args = [*base_args, _like(term), 200]
+                cur.execute(
+                    f"""
+                    select m.conversation_id, m.seq, m.role, m.created_at, m.text,
+                           m.synced_at, c.source, c.title, c.updated_at, c.message_count
+                      from (
+                            select conversation_id, seq, role, created_at, text, synced_at
+                              from mem.conv_message
+                            union all
+                            select conversation_id, seq, role, created_at, text, received_at as synced_at
+                              from mem.live_event where reconciled_at is null
+                           ) m
+                      join mem.conv c on c.id = m.conversation_id
+                     where {' and '.join(where)}
+                     order by m.created_at desc
+                     limit %s
+                    """,
+                    args,
+                )
+                for row in cur.fetchall():
+                    key = (row[0], row[1], row[3], (row[4] or "")[:80])
+                    seen.setdefault(key, {"row": row, "terms": set()})["terms"].add(term)
+                # 够用了就停：长 query 会生成多个 4-gram，没必要每个都远程扫一遍。
+                if len(seen) >= max(limit * 4, 24):
+                    break
+
+    part_terms = {p for p in _TERM_SPLIT.split(kw) if p}
+    matches: list[dict[str, Any]] = []
+    for hit in seen.values():
+        row, matched = hit["row"], sorted(hit["terms"])
+        text = row[4] or ""
+        low = text.lower()
+        matched = [t for t in matched if t.lower() in low]
+        if not matched:
+            continue
+        at = row[3].astimezone().isoformat() if row[3] else None
+        conv = row[0]
+        weight = sum(3 if t == kw else (2 if t in part_terms else 1) for t in matched)
+        matches.append({
+            "scope": "personal",
+            "type": "message",
+            "conversation_id": conv,
+            "source": row[6],
+            "title": row[7] or "",
+            "updated_at": row[8].astimezone().isoformat() if row[8] else None,
+            "last_synced_at": row[8].astimezone().isoformat() if row[8] else None,
+            "message_count": row[9],
+            "seq": row[1],
+            "role": row[2],
+            "at": at,
+            "anchor": _anchor("mem.conv", conv, row[1], at),
+            "snippet": _snippet_around(text, kw if kw.lower() in low else matched[0], 160),
+            "matched_terms": matched[:8],
+            "score": weight,
+            "synced_at": row[5].astimezone().isoformat() if row[5] else None,
+        })
+    matches.sort(key=lambda m: (m["score"], m["updated_at"] or "", m["seq"]), reverse=True)
+    matches = matches[:limit]
+
+    # 每条命中补前后各 context 条，AI 不用再发一次 conv_get 才能看懂。
+    if context > 0:
+        _attach_contexts(matches, context)
+
+    conversations: dict[str, dict[str, Any]] = {}
+    for match in matches:
+        item = conversations.setdefault(match["conversation_id"], {
+            "id": match["conversation_id"],
+            "source": match["source"],
+            "title": match["title"],
+            "updated_at": match["updated_at"],
+            "last_synced_at": match["last_synced_at"],
+            "message_count": match["message_count"],
+            "hits": 0,
+        })
+        item["hits"] += 1
+    return {
+        "keyword": kw,
+        "count": len(matches),
+        "matches": matches,
+        "conversations": list(conversations.values()),
+        "hint": "拿 match.anchor / conversation_id+seq 就能回溯；要更多上下文用 conv_get(conv_id, compact=True)。",
+    }
+
+
+def _attach_contexts(matches: list[dict[str, Any]], radius: int = 1) -> None:
+    """一次把同一会话的多个命中窗口查完，避免 5 条命中发 5 次远程查询。"""
+    groups: dict[str, set[int]] = {}
+    for match in matches:
+        seq = int(match.get("seq") or 0)
+        groups.setdefault(match["conversation_id"], set()).update(
+            range(seq - radius, seq + radius + 1)
+        )
+    buckets: dict[str, dict[int, list[dict[str, Any]]]] = {}
+    for conv_id, seqs in groups.items():
+        wanted = sorted(s for s in seqs if s >= 0)
+        if not wanted:
+            continue
+        with _conn(MEM_DSN) as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    """select seq, role, created_at, text, synced_at from (
+                          select seq, role, created_at, text, synced_at from mem.conv_message
+                           where conversation_id=%s and seq = any(%s)
+                          union all
+                          select seq, role, created_at, text, received_at as synced_at
+                            from mem.live_event
+                           where conversation_id=%s and reconciled_at is null and seq = any(%s)
+                        ) u order by seq asc, created_at asc limit 60""",
+                    (conv_id, wanted, conv_id, wanted),
+                )
+                rows = cur.fetchall()
+        bucket: dict[int, list[dict[str, Any]]] = {}
+        for row in rows:
+            at = row[2].astimezone().isoformat() if row[2] else None
+            bucket.setdefault(row[0], []).append({
+                "seq": row[0], "role": row[1], "at": at,
+                "text": _snippet(row[3], 600),
+                "anchor": _anchor("mem.conv", conv_id, row[0], at),
+                "synced_at": row[4].astimezone().isoformat() if row[4] else None,
+            })
+        buckets[conv_id] = bucket
+    for match in matches:
+        seq = int(match.get("seq") or 0)
+        bucket = buckets.get(match["conversation_id"], {})
+        match["context"] = [
+            item
+            for s in range(seq - radius, seq + radius + 1)
+            for item in bucket.get(s, [])
+        ]
+
+
 
 # ---------------- live turn capture ----------------
 
@@ -1191,13 +1829,13 @@ def ingest_event(source: str, conversation_id: str, role: str, text: str,
     source = (source or "unknown").strip()[:64]
     conversation_id = (conversation_id or "").strip()
     if not conversation_id:
-        raise ValueError("conversation_id ????")
+        raise ValueError("conversation_id 不能为空")
     role = (role or "user").strip().lower()
     if role not in {"user", "assistant", "system", "tool"}:
         raise ValueError("role ??? user/assistant/system/tool")
     text = (text or "").replace("\x00", "")
     if not text.strip():
-        raise ValueError("text ????")
+        raise ValueError("text 不能为空")
     stamp = _ms(created_at, None)
     created = datetime.fromtimestamp(stamp / 1000, tz=timezone.utc) if stamp else datetime.now(timezone.utc)
     event_id = (event_id or "").strip() or _digest(
@@ -1331,7 +1969,7 @@ def _recall_score(r: dict, now: datetime) -> float:
 
 
 def select_recall(query: str, user_id: str, limit: int = 5,
-                  conversation_id: str = "") -> list[dict]:
+                  conversation_id: str = "", include_pending: bool = False) -> list[dict]:
     """gate 的召回选择：宽召回（每个检索词各查一次）→ 分层 → 加权 → 配额。"""
     q = (query or "").strip()
     if not q:
@@ -1340,7 +1978,7 @@ def select_recall(query: str, user_id: str, limit: int = 5,
     terms = [t for t in re.split(r"[\s,，。;；、/|]+", q) if len(t) >= 2][:4]
     seen: dict[tuple, dict] = {}
     for term in [q, *terms]:
-        for r in search_personal(term, user_id, _GATE_CANDIDATES_PER_TERM):
+        for r in search_personal(term, user_id, _GATE_CANDIDATES_PER_TERM, include_pending):
             key = (r.get("source"), r.get("id"))
             if conversation_id and r.get("id") == conversation_id:
                 continue
@@ -1384,8 +2022,14 @@ def select_recall(query: str, user_id: str, limit: int = 5,
 
 def _gate_log(user_id: str, source: str, conversation_id: str, turn: int | None,
               query: str, merged: list[dict], injected_chars: int, latency_ms: int,
-              ok: bool = True, error: str = "") -> None:
-    """Best-effort recall log row; never raise into the gate path."""
+              ok: bool = True, error: str = "", stage_ms: dict | None = None,
+              slow: bool = False) -> int:
+    """Best-effort recall log row; never raise into the gate path.
+
+    2026-11-18：新增 stage_ms（阶段耗时）与 slow（>=9500ms 危险区），并返回行 id——
+    端点层拿到 id 后可以补一条「客户端已断开」（client_gone），把
+    「服务端跑完了但客户端早走了」这种同一次调用两边口径不一致的情况记清楚。
+    """
     hit_ids = [str(r.get("id")) for r in merged if r.get("id")]
     hit_scores = [round(float(r["score"]), 6) for r in merged
                   if isinstance(r.get("score"), (int, float))]
@@ -1395,49 +2039,603 @@ def _gate_log(user_id: str, source: str, conversation_id: str, turn: int | None,
                 cur.execute(
                     """insert into mem.gate_log
                        (user_id,source,conversation_id,turn,query,query_hash,hit_ids,
-                        hit_scores,count,injected_chars,latency_ms,ok,error)
-                       values (%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s)""",
+                        hit_scores,count,injected_chars,latency_ms,ok,error,stage_ms,slow)
+                       values (%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s,%s,%s,%s::jsonb,%s)
+                       returning id""",
                     (user_id, (source or "gate")[:64], conversation_id or "", turn,
                      (query or "")[:4000], _digest(query or ""),
                      json.dumps(hit_ids, ensure_ascii=False),
                      json.dumps(hit_scores),
                      len(merged), int(injected_chars), int(latency_ms),
-                     bool(ok), (error or "")[:500]),
+                     bool(ok), (error or "")[:500],
+                     json.dumps(stage_ms or {}, ensure_ascii=False), bool(slow)),
                 )
+                row = cur.fetchone()
             c.commit()
+        return int(row[0]) if row else 0
     except Exception:
-        pass
+        return 0
+
+
+def mark_gate_client_gone(log_id: int) -> bool:
+    """把一行 gate_log 标成「客户端在服务端跑完前已断开」。
+
+    客户端视角这是失败（模型没拿到上下文），服务端视角 ok 仍为 true（它确实跑完了）。
+    """
+    if not log_id:
+        return False
+    try:
+        with _conn(MEM_DSN) as c:
+            with c.cursor() as cur:
+                cur.execute("update mem.gate_log set client_gone = true where id = %s", (log_id,))
+            c.commit()
+        return True
+    except Exception:
+        return False
+
+
+# 客户端 10s 超时的危险区阈值：>= 这个值的请求单独标 slow，便于看趋势。
+GATE_SLOW_MS = 9500
+
+
+def gate_stats(hours: int = 24) -> dict:
+    """gate 健康聚合（POST /gate/stats）：服务端与客户端两个视角都给。
+
+    - ok/failed：服务端视角（failed = 抛异常的）
+    - timeout：**客户端视角**失败 = client_gone（服务端跑完了但客户端早走了）
+    - slow_ge_9500：latency_ms >= 9500 的危险区条数（含成功与失败）
+    - stage：各阶段耗时的 p50/p95（毫秒），用于定位 5.5s 花在哪
+    """
+    hours = max(1, min(int(hours or 24), 24 * 7))
+    out: dict[str, Any] = {"window_hours": hours, "total": 0, "ok": 0, "failed": 0,
+                           "timeout": 0, "slow_ge_9500": 0,
+                           "p50_ms": None, "p95_ms": None, "p99_ms": None, "max_ms": None,
+                           "stage": {}}
+    with _conn(MEM_DSN) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                """select count(*),
+                          count(*) filter (where ok),
+                          count(*) filter (where not ok),
+                          count(*) filter (where client_gone),
+                          count(*) filter (where latency_ms >= %(slow)s),
+                          percentile_cont(0.5) within group (order by latency_ms),
+                          percentile_cont(0.95) within group (order by latency_ms),
+                          percentile_cont(0.99) within group (order by latency_ms),
+                          max(latency_ms)
+                   from mem.gate_log
+                   where created_at >= now() - (%(h)s || ' hours')::interval""",
+                {"slow": GATE_SLOW_MS, "h": hours},
+            )
+            row = cur.fetchone()
+            out.update({
+                "total": int(row[0]), "ok": int(row[1]), "failed": int(row[2]),
+                "timeout": int(row[3]), "slow_ge_9500": int(row[4]),
+                "p50_ms": round(float(row[5])) if row[5] is not None else None,
+                "p95_ms": round(float(row[6])) if row[6] is not None else None,
+                "p99_ms": round(float(row[7])) if row[7] is not None else None,
+                "max_ms": int(row[8]) if row[8] is not None else None,
+            })
+            # 阶段耗时：jsonb 展开后按 key 聚合
+            cur.execute(
+                """select kv.key,
+                          count(*),
+                          percentile_cont(0.5) within group (order by (kv.value #>> '{}')::int),
+                          percentile_cont(0.95) within group (order by (kv.value #>> '{}')::int)
+                   from mem.gate_log g, jsonb_each(g.stage_ms) kv
+                   where g.created_at >= now() - (%(h)s || ' hours')::interval
+                     and g.stage_ms is not null
+                   group by kv.key order by kv.key""",
+                {"h": hours},
+            )
+            for key, n, p50, p95 in cur.fetchall():
+                out["stage"][key] = {"n": int(n), "p50_ms": round(float(p50)),
+                                     "p95_ms": round(float(p95))}
+    return out
+
+
+_CONTEXT_MAX = 4000          # gate 上下文总预算（原 `[:4000]` 硬截断的那个数）
+_TRUNC_MARK = "…（截断）"
+
+
+def _render_block(idx: int, r: dict) -> str:
+    title = (r.get("title") or "").strip()
+    snippet = (r.get("snippet") or "").strip().replace("\n", " ")[:300]
+    kind = r.get("kind") or r.get("scope") or ""
+    return f"{idx}. [{kind}] {title}\n   {snippet}"
+
+
+def _build_context(merged: list[dict]) -> str:
+    """按配额拼 gate 上下文（2026-11-17）：core 先占，召回在剩余预算里**按条目边界**取。
+
+    为什么不能再用 `[:4000]` 从头硬截断：core 是 `merged.insert(0, …)` 插在队首的，
+    硬截断会把召回段最后一条切成半句话——一条被砍断的记忆是废的，还会误导判断。
+    宁可少给一条完整记忆，也不给一条断句。
+
+    边界：① 配额按**渲染后**字符算（含标题与缩进，否则会虚超）；
+         ② 连一条完整召回都放不下时，至少保留 1 条（截断它，并标 `…（截断）`），
+            与 core 的「首条必留」同一个原则：不允许只剩 core。
+    """
+    head = ("## 相关记忆（供参考，未审不入）\n"
+            "以下为检索到的历史结论，判断以当前事实为准。\n")
+    cores = [r for r in merged if r.get("core")]
+    recalls = [r for r in merged if not r.get("core")]
+    used = len(head)
+    blocks: list[str] = []
+    idx = 1
+    for r in cores:
+        blk = _render_block(idx, r)
+        if blocks and used + len(blk) + 1 > _CONTEXT_MAX:
+            break
+        blocks.append(blk)
+        used += len(blk) + 1
+        idx += 1
+    recall_added = False
+    for r in recalls:
+        blk = _render_block(idx, r)
+        if used + len(blk) + 1 <= _CONTEXT_MAX:
+            blocks.append(blk)
+            used += len(blk) + 1
+            idx += 1
+            recall_added = True
+            continue
+        if not recall_added:
+            room = _CONTEXT_MAX - used - 1
+            if room > len(_TRUNC_MARK) + 20:
+                blocks.append(_render_block(idx, r)[: room - len(_TRUNC_MARK)] + _TRUNC_MARK)
+        break
+    return head + "\n".join(blocks)
 
 
 def gate(query: str, user_id: str, source: str = "gate", conversation_id: str = "",
-         role: str = "user", limit: int = 5, turn: int | None = None) -> dict:
-    """Blocking pre-answer gate: log the prompt, retrieve context, return it."""
+         role: str = "user", limit: int = 5, turn: int | None = None,
+         include_pending: bool = False, log_sink: dict | None = None) -> dict:
+    """Blocking pre-answer gate: log the prompt, retrieve context, return it.
+
+    2026-11-18：按阶段计时（ingest / recall / core / assemble / log）写进 gate_log.stage_ms，
+    端点层可据此补 client_gone；log_sink 用于把 gate_log 行 id 传回端点（不改进 HTTP 响应体）。
+    """
     t0 = time.monotonic()
+    stages: dict[str, int] = {}
+
+    def _lap(name: str, since: float) -> float:
+        stages[name] = _gate_elapsed_ms(since)
+        return time.monotonic()
+
     q = (query or "").strip()
     merged: list[dict] = []
     context = ""
+    lap = t0
     try:
         if not q:
-            raise ValueError("query ????")
+            raise ValueError("query 不能为空")
         limit = max(1, min(int(limit), 10))
         trace = None
         if conversation_id:
             event = ingest_event(source, conversation_id, role, q, title="", meta={"gate": True})
             trace = event.get("event_id")
-        merged = select_recall(q, user_id, limit, conversation_id)
-        lines = ["## ???????", "???????????????????????????"]
-        for i, r in enumerate(merged, 1):
-            title = (r.get("title") or "").strip()
-            snippet = (r.get("snippet") or "").strip().replace("\n", " ")[:300]
-            kind = r.get("kind") or r.get("scope") or ""
-            lines.append(f"{i}. [{kind}] {title}\n   {snippet}")
-        context = "\n".join(lines)[:4000]
-        _gate_log(user_id, source, conversation_id, turn, q, merged, len(context),
-                  _gate_elapsed_ms(t0))
+        lap = _lap("ingest", lap)
+        merged = select_recall(q, user_id, limit, conversation_id, include_pending)
+        lap = _lap("recall", lap)
+        # P5 core 常驻（零 DDL）：不管检索有没有命中，core 条目无条件进上下文。
+        # 2026-11-17 加字符预算：先按 last_hit 倒序（最新的优先占预算）→ budget() 截断
+        # （单条 300 字、累计 2000 字、首条必留）→ **只对真正进了上下文的 id 做 touch()**。
+        # 没进上下文却记命中，会让 LRU 淘汰失真，等于给没被用过的记忆续命。
+        try:
+            active, _hits = _core._load()
+            if active and os.environ.get("MEM_CORE", "off").strip().lower() in (
+                    "1", "on", "true", "yes"):
+                ordered = sorted(active, key=lambda d: _hits.get(d) or active.get(d) or "",
+                                 reverse=True)[:_core.MAX_CORE]
+                with _conn(MEM_DSN) as cc:
+                    with cc.cursor() as cur2:
+                        cur2.execute(
+                            "select path, kind, title, body, updated_at from mem.doc "
+                            "where user_id=%(uid)s and path = any(%(ids)s) "
+                            "and path <> all(%(sup)s) limit %(lim)s",
+                            _visibility.with_hidden(
+                                {"uid": user_id, "ids": ordered, "lim": _core.MAX_CORE}),
+                        )
+                        core_rows = cur2.fetchall()
+                by_id = {row[0]: row for row in core_rows}
+                cands = [
+                    {
+                        "id": d,
+                        "kind": by_id[d][1],
+                        "title": by_id[d][2] or "",
+                        "snippet": _snippet(by_id[d][3]),
+                        "date": by_id[d][4].isoformat() if by_id[d][4] else None,
+                        "text": (by_id[d][2] or "") + "\n" + _snippet(by_id[d][3]),
+                    }
+                    for d in ordered if d in by_id
+                ]
+                picked = _core.budget(cands)
+                for r in reversed(picked):
+                    merged.insert(0, {
+                        "scope": "personal", "source": "mem.doc", "kind": r["kind"],
+                        "id": r["id"], "title": r["title"], "snippet": r["snippet"],
+                        "date": r["date"], "score": 1.0, "core": True,
+                    })
+                if picked:
+                    _core.touch([r["id"] for r in picked])
+        except Exception:
+            pass  # core 注入失败不能把 gate 拖死
+        lap = _lap("core", lap)
+        context = _build_context(merged)
+        # 项目开工必读（2026-11-18）：按「项目词 + 任务词」双命中推规范清单，
+        # 不看检索分数——规矩是「动这块就该读」，跟这个问题像不像没关系。
+        proj: dict[str, Any] = {"matched": False, "project": "", "reads": [], "block": ""}
+        try:
+            proj = _projects.match(q)
+            if proj.get("matched"):
+                context = proj["block"] + "\n\n" + context
+        except Exception:
+            proj = {"matched": False, "project": "", "reads": [], "block": ""}
+        lap = _lap("assemble", lap)
+        latency = _gate_elapsed_ms(t0)
+        log_id = _gate_log(user_id, source, conversation_id, turn, q, merged, len(context),
+                           latency, stage_ms=stages, slow=latency >= GATE_SLOW_MS)
+        stages["log"] = _gate_elapsed_ms(lap)
+        if log_sink is not None:
+            log_sink["id"] = log_id
         return {"ok": True, "trace_id": trace, "query": q, "count": len(merged),
-                "results": merged, "context": context}
+                "results": merged, "context": context,
+                "project_reads": {k: proj.get(k) for k in ("matched", "project", "hits", "reads")}}
     except Exception as e:
-        _gate_log(user_id, source, conversation_id, turn, q, merged, len(context),
-                  _gate_elapsed_ms(t0), ok=False, error=f"{type(e).__name__}: {e}")
+        latency = _gate_elapsed_ms(t0)
+        log_id = _gate_log(user_id, source, conversation_id, turn, q, merged, len(context),
+                           latency, ok=False, error=f"{type(e).__name__}: {e}",
+                           stage_ms=stages, slow=latency >= GATE_SLOW_MS)
+        if log_sink is not None:
+            log_sink["id"] = log_id
         raise
 
+
+# ---------------------------------------------------------------------------
+# v1 review-gated（2026-11-16，零 DDL）：
+#   remember 默认写 cloud/<user>/pending/...；检索默认排除 pending；
+#   review 通过才把 path 从 pending/ 移回正式区，并同步 mem.edge.src（图谱别断链）。
+# ---------------------------------------------------------------------------
+
+_ALLOWED_KINDS = {"event", "decision", "artifact", "entity", "belief", "metric"}
+# 出处检查（2026-11-17 扩形态）：只认 `session-xxx` / `文件:行号` / 命令原文的旧正则，
+# 会把「带仓库相对路径」的正经出处判成「无出处」——守库人 26 条待审里 17 条被迫走 force，
+# 闸门等于没有。所以按形态枚举，不再靠一套窄正则猜：
+#   ① session id / uuid   ② 文件:行号 / 文件:行号-行号
+#   ③ 仓库相对路径（含 `/` 且带扩展名：docs/... research/... memory-mcp/...）
+#   ④ Windows 绝对路径  ⑤ commit <sha>  ⑥ pid=N
+#   ⑦ 命令原文（git/curl/python/node/pnpm…）
+# 另加 `source:` 显式声明口子：作者写 `source: <任意非空>` 一律算有出处——显式声明优先于正则猜。
+_SOURCE_RE = re.compile(
+    r"(session[:=_-]?[0-9a-z-]{6,}"                                   # session-xxx
+    r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"                          # uuid 前段
+    r"|\bcommit\s+[0-9a-f]{7,40}\b"                                   # commit <sha>
+    r"|\bpid\s*[:=]\s*\d+"                                            # pid=1234
+    r"|\b[A-Za-z]:\\[^\s，。；、)）」\"']+"                            # C:\... / D:\...
+    r"|(?<![\w/])[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]+)*\.(?:md|py|go|ps1|ts|tsx|js"
+    r"|json|yaml|yml|sql|sh|txt|csv|log|diff|patch)(?::\d+(?:-\d+)?)?"  # 仓库相对路径 / 文件:行号
+    r"|[0-9a-f]{40})"
+    r"|\b(?:git|curl|python3?|node|pnpm|npm|pip|psql|pytest|go|dotnet|pwsh|powershell)\s+\S",
+    re.I,
+)
+_SOURCE_DECL_RE = re.compile(r"source\s*[:：]\s*\S", re.I)
+
+
+def _has_source(body: str) -> bool:
+    """有出处：显式 `source:` 声明优先，其次按形态匹配。"""
+    text = body or ""
+    return bool(_SOURCE_DECL_RE.search(text) or _SOURCE_RE.search(text))
+
+
+_SOURCE_HINT = (
+    "无出处（出处检查未过）：正文里要带以下任一 —— "
+    "① 仓库相对路径（docs/… 、research/… 、memory-mcp/…，含 / 且带扩展名）"
+    "② 绝对路径（C:\\… / D:\\…）"
+    "③ 文件:行号 或 文件:行号-行号 "
+    "④ `commit <sha>` / `pid=N` / `session-<id>` "
+    "⑤ 命令原文（以 git/curl/python/node/pnpm 等开头）"
+    "⑥ 显式写一行 `source: <任意说明>`（作者声明优先，正则猜不到时用这条）"
+)
+# 冲突检测（2026-11-17 重写）：旧版按「关键词重叠」判，只要两条都出现 `df`/`R@10`
+# 这类词就算冲突——今天 26 条待审里 2 条假冲突（a5651064 vs 519513e8 主题完全不同），
+# 结果是真正需要人裁的 0 条，全被机器拦下等人。
+# 新判据：必须**同 topic/同实体** + **两条各自方向明确且相反** + **都没写「撤回/修正」**。
+_DIRECTION_PAIRS: tuple[tuple[frozenset[str], frozenset[str]], ...] = (
+    (frozenset({"全作废", "作废", "废弃", "废弃不用", "撤掉"}),
+     frozenset({"继续保留", "仍有效", "继续使用", "保留使用"})),
+    (frozenset({"上涨", "上升"}), frozenset({"下跌", "下降"})),
+    (frozenset({"判赢", "算赢", "判为赢"}),
+     frozenset({"判否", "判为否", "不算赢"})),
+    (frozenset({"已修好", "已修复", "修复完成"}),
+     frozenset({"未修复", "待修", "没修好"})),
+)
+# 注意：`通过`/`有效`/`增加`/`保留`/`取消` 这类词在我们的技术文里是术语（「有效 gram」「通过审核」），
+# 拿它们当方向词会造出假冲突——a5651064 的 `判否` 对 b2ceb918 的 `有效 gram` 就被误判过一次。
+# 所以方向词只取「结论性、不可当术语用」的少数几个。
+# 「撤回/修正」字样 = 作者在自我修正，直接判 supersede，不进冲突队列。
+_SUPERSEDE_RE = re.compile(r"(撤回|修正|订正|推翻|取代|supersede)", re.I)
+_REF_OTHER_RE = re.compile(
+    r"(前一条|上一条|前述|上述结论|上述裁定|原始裁定|之前那条"
+    r"|[0-9a-f]{8}(?![0-9a-f])"                          # 另一个 doc 的 8 位 id 前缀
+    r"|[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-/]*\.(?:md|json))",
+    re.I,
+)
+
+
+def _directions(text: str) -> dict[int, int]:
+    """每条文档在每组方向词上取到哪一侧：{pair_index: +1/-1}；两侧都出现则该组作废。"""
+    got: dict[int, int] = {}
+    for pi, (pos, neg) in enumerate(_DIRECTION_PAIRS):
+        has_pos = any(w in text for w in pos)
+        has_neg = any(w in text for w in neg)
+        if has_pos != has_neg:
+            got[pi] = 1 if has_pos else -1
+    return got
+
+
+def _is_supersede(body: str, title: str) -> bool:
+    """写了「撤回/修正」且指向另一条文档 → supersede（自我修正，不算冲突）。"""
+    text = f"{title}\n{body}"
+    return bool(_SUPERSEDE_RE.search(text) and _REF_OTHER_RE.search(text))
+
+
+def _review_log(entry: dict) -> None:
+    """打回/放行的记录落到 jsonl（不进库，零 DDL；可当审计线索）。"""
+    try:
+        path = _DF_CACHE_PATH.parent / "review_log.jsonl"
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _find_conflict(cur, user_id: str, path: str, body: str, title: str) -> dict | None:
+    """同 topic/同实体里找「结论方向相反」的那条；返回 {type: conflict|supersede, ...}。
+
+    只有三种结果：None（没候选 / 方向不相反 / 已自我修正）、supersede（作者撤回或修正了
+    前一条）、conflict（方向确实相反，需要人裁）。旧版只比关键词重叠，会把同主题不同侧面的
+    两条判成冲突——今天 2 条假冲突（a5651064 vs 519513e8，只共有 `df`/`R@10`）就是这么来的。
+    """
+    if _is_supersede(body, title):
+        return {"type": "supersede", "path": path}
+    mine = _directions(f"{title}\n{body}")
+    if not mine:
+        return None
+    cur.execute(
+        f"""
+        select d.path, d.title, left(d.body, 400)
+          from mem.edge e
+          join mem.edge e2 on e2.dst = e.dst and e2.user_id = e.user_id and e2.src <> e.src
+          join mem.doc  d  on d.path = e2.src and d.user_id = e2.user_id
+         where e.src = %(src)s and e.user_id = %(uid)s
+           and d.path not like '%%/pending/%%'
+           and d.updated_at >= now() - interval '7 days'
+           {_visibility.hidden_param('d.path')}
+         order by d.updated_at desc
+        """,
+        _visibility.with_hidden({"src": path, "uid": user_id}),
+    )
+    for other_path, other_title, other_body in cur.fetchall():
+        other_text = f"{other_title or ''}\n{other_body or ''}"
+        if _is_supersede(other_body or "", other_title or ""):
+            continue                       # 对方也声明了自我修正，不算冲突
+        theirs = _directions(other_text)
+        for pi, side in mine.items():
+            if pi in theirs and theirs[pi] != side:
+                return {"type": "conflict", "path": other_path,
+                        "why": f"方向词相反（第 {pi + 1} 组）"}
+    return None
+
+
+def _referenced_doc(cur, user_id: str, body: str) -> str | None:
+    """正文里引用到的另一条 doc（8 位 id 前缀唯一命中时才返回它的 path，猜不准就不猜）。"""
+    ids = {m for m in re.findall(r"(?<![0-9a-f])[0-9a-f]{8}(?![0-9a-f])", body or "")}
+    if not ids:
+        return None
+    cur.execute(
+        "select path from mem.doc where user_id=%(uid)s and path like any(%(pats)s)"
+        " and path not like '%%/rejected/%%' and path <> all(%(sup)s)",
+        _visibility.with_hidden({"uid": user_id, "pats": ["%" + i + "%" for i in ids]}),
+    )
+    paths = [r[0] for r in cur.fetchall()]
+    return paths[0] if len(paths) == 1 else None
+
+
+def review(user_id: str, doc_id: str, decision: str = "pass", reason: str = "", actor: str = "user") -> dict:
+    """审一条待审记忆。三项检查全过才放行；decision='force' 可跳过检查（需写 reason）。"""
+    decision = (decision or "pass").strip().lower()
+    with _conn(MEM_DSN) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "select path, kind, title, body from mem.doc where user_id=%s and path=%s",
+                (user_id, doc_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("找不到这条记忆：id 要用 remember 返回的原样字符串")
+            path, kind, title, body = row[0], row[1], row[2] or "", row[3] or ""
+            if "/pending/" not in path:
+                return {"ok": False, "id": path, "decision": "skip", "reason": "不在待审区，无需 review"}
+
+            problems: list[str] = []
+            if kind not in _ALLOWED_KINDS:
+                problems.append(f"kind 不在白名单（{kind}）：只收 {sorted(_ALLOWED_KINDS)}")
+            if not _has_source(body):
+                problems.append(_SOURCE_HINT)
+            conflict = _find_conflict(cur, user_id, path, body, title)
+            supersede_of = None
+            if conflict and conflict.get("type") == "conflict":
+                problems.append(
+                    f"与已通过的结论方向相反：{conflict['path']}（{conflict.get('why', '')}）")
+            elif conflict and conflict.get("type") == "supersede":
+                # 作者自己写了「撤回/修正 + 指向前一条」→ 自我修正，不进冲突队列、不拦。
+                supersede_of = conflict.get("path")
+
+            forced = decision == "force"
+            if problems and not forced:
+                # 归档而不是留在 pending（2026-11-17）：reject 只写日志、文件仍留在 pending/，
+                # 而 pending 计数按 `%/pending/%` 数 → 被判 reject 的条目永远计入积压，
+                # pending 永远归不了零。挪到 `cloud/<user>/rejected/`（不删文件、可按 id 直取），
+                # 检索侧同时排除 `%/rejected/%`，计数自然归零。
+                reject_path = path.replace("/pending/", "/rejected/", 1)
+                cur.execute(
+                    "update mem.doc set path=%s, updated_at=now() where user_id=%s and path=%s",
+                    (reject_path, user_id, path),
+                )
+                cur.execute(
+                    "update mem.edge set src=%s where user_id=%s and src=%s",
+                    (reject_path, user_id, path),
+                )
+                _review_log({"ts": datetime.now(timezone.utc).isoformat(), "id": path,
+                             "archived_to": reject_path,
+                             "decision": "reject", "problems": problems, "reason": reason})
+                _history.add(path, "reject", actor, new_hash=reject_path,
+                             reason="; ".join(problems))
+                # Observation 跟随（2026-11-18）：文档搬去 rejected/ 了，观测记录不能还挂在
+                # pending 路径上装活——不跟随就会留下「指向空路径的 active」幽灵。
+                try:
+                    _observation.relocate(path, reject_path, user_id, status="archived",
+                                          reason="review rejected: " + "; ".join(problems)[:180])
+                except Exception:
+                    pass
+                # 事项侧也要知道（2026-11-18）：挂了但被拒 → 关联标 rejected，工作台第 ④ 格可见。
+                try:
+                    _issues.mark_rejected(path, "; ".join(problems)[:160], reject_path)
+                except Exception:
+                    pass
+                c.commit()
+                return {"ok": False, "id": path, "archived_to": reject_path,
+                        "decision": "rejected", "problems": problems,
+                        "hint": "已归档到 rejected/（不删、可按 id 直取）；改好再 remember 一遍"}
+
+            new_path = path.replace("/pending/", "/", 1)
+            cur.execute(
+                "update mem.doc set path=%s, updated_at=now() where user_id=%s and path=%s",
+                (new_path, user_id, path),
+            )
+            cur.execute(
+                "update mem.edge set src=%s where user_id=%s and src=%s",
+                (new_path, user_id, path),
+            )
+            _review_log({"ts": datetime.now(timezone.utc).isoformat(), "id": path,
+                         "new_id": new_path, "decision": "forced" if forced else "pass",
+                         "problems": problems, "reason": reason,
+                         "supersede_of": supersede_of})
+            _history.add(path, "approve", actor, new_hash=new_path,
+                         reason=(reason or ("forced: " + "; ".join(problems) if forced else
+                                            ("supersede " + supersede_of if supersede_of else ""))))
+            # Observation 跟随：pending → 正式区，obs_id 换成新路径，状态保持 active。
+            try:
+                _observation.relocate(path, new_path, user_id, status="active",
+                                      reason="review passed")
+            except Exception:
+                pass
+            # 事项关联也跟着搬（否则链接指向已不存在的 pending 路径）。
+            try:
+                _issues.mark_moved(path, new_path)
+            except Exception:
+                pass
+            if supersede_of:
+                # 自我修正：把被撤回的那条登记进 supersede（检索时隐藏，不删数据）。
+                target = _referenced_doc(cur, user_id, body)
+                if target:
+                    try:
+                        _supersede.add(target, new_path, reason=(title or "")[:160], actor=actor)
+                    except Exception:
+                        pass
+        c.commit()
+    return {"ok": True, "id": new_path, "decision": "forced" if forced else "pass",
+            "problems_skipped": problems}
+
+
+def pending_summary(user_id: str) -> dict:
+    """待审积压：多少条、最老一条多久了。"""
+    with _conn(MEM_DSN) as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "select count(*), min(updated_at), max(updated_at) from mem.doc "
+                "where user_id=%s and path like '%%/pending/%%'",
+                (user_id,),
+            )
+            n, oldest, newest = cur.fetchone()
+            cur.execute(
+                "select path, kind, title, updated_at from mem.doc "
+                "where user_id=%s and path like '%%/pending/%%' order by updated_at limit 5",
+                (user_id,),
+            )
+            samples = [
+                {"id": r[0], "kind": r[1], "title": r[2], "date": r[3].isoformat() if r[3] else None}
+                for r in cur.fetchall()
+            ]
+    age_h = None
+    if oldest:
+        age_h = round((datetime.now(timezone.utc) - oldest).total_seconds() / 3600, 1)
+    return {"count": n, "oldest_age_hours": age_h,
+            "oldest_at": oldest.isoformat() if oldest else None,
+            "newest_at": newest.isoformat() if newest else None, "samples": samples}
+# P1 同义短语扩展（2026-11-16，最小词表，不搞同义词库）：
+# 目标是填掉「写回失败了怎么办」这类同义鸿沟——query 用一个词、文档用另一个词，gram 永远撞不上。
+# 开关 MEM_SYNONYMS=off 可一键关掉（对照实验用），默认 on。
+_SYNONYM_GROUPS = (
+    ("失败", "重试", "报错", "错误"),
+    ("写回", "回填", "落库", "入库"),
+    ("超时", "卡住", "慢", "阻塞"),
+    ("删除", "清理", "回收", "清除"),
+    ("检索", "搜索", "查找", "召回"),
+)
+
+
+def _expand_synonyms(terms: list[str]) -> list[str]:
+    if os.environ.get("MEM_SYNONYMS", "on").strip().lower() in ("0", "off", "false", "no"):
+        return terms
+    extra: list[str] = []
+    for group in _SYNONYM_GROUPS:
+        if any(any(w in term for w in group) for term in terms):
+            extra.extend(group)
+    if not extra:
+        return terms
+    return list(dict.fromkeys([*terms, *extra]))[:12]
+
+# 第二步（2026-11-17）：数字归一化（查询期补裸形/千分位形，不动索引、0 DDL）。
+# 病根：11 条 T2 是纯数字题（query 写 20494、doc 里是 20,494），df=0 → 换任何打分公式都是 0 分。
+# 做法：抽 query 里所有数字形态，同时补「去分隔符的裸形」和「加千分位的形态」，两个方向都覆盖。
+_NUM_RE = re.compile(r"\d[\d,\uFF0C. ]*\d|\d")
+
+
+_DIGIT_MAX = 8  # 数字变体自身也要有界：多数字 query（版本号、多组编号）不能让 SQL 项数失控
+
+
+def _digit_variants(terms: list[str], query: str) -> list[str]:
+    """数字形态变体。**不占用实词的 16 槽上限**（2026-11-17）。
+
+    为什么单独占额度：数字变体只是同一个数字的另一种写法（`2026-11-16` → `2026/2,026/11/16`），
+    跟中文实词不该抢位置。实测 V2-006 一条 query 里日期就产生 4 个变体，挤进同一个 16 槽列表
+    等于用「重复的同一件事」占掉实词额度。
+    为什么仍要 _DIGIT_MAX：变体数量与 query 里的数字组数成正比，不设上界时
+    「v1.2.3 到 v1.2.10 的 20 处改动」这类 query 会拼出几十个 ilike，SQL 直接变慢。
+    """
+    extra: list[str] = []
+    for raw in _NUM_RE.findall(query or ""):
+        bare = re.sub(r"[,，. ]", "", raw)
+        if not bare:
+            continue
+        extra.append(bare)
+        if len(bare) >= 4:
+            grouped = bare
+            for i in range(len(bare) - 3, 0, -3):
+                grouped = grouped[:i] + "," + grouped[i:]
+            extra.append(grouped)
+    if not extra:
+        return terms
+    out = list(dict.fromkeys(terms))[:16]
+    seen = set(out)
+    added = 0
+    for e in dict.fromkeys(extra):
+        if e in seen:
+            continue
+        if added >= _DIGIT_MAX:
+            break
+        seen.add(e)
+        out.append(e)
+        added += 1
+    return out

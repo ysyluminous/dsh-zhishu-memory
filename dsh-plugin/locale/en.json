@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Zhishu memory suite",
+    "description": "One bundle for four jobs: retrieve memory before a turn and write it back after, a context budget guard, redline approvals for irreversible actions, and a workbench in the bottom-right capsule — memory service, pg16 and Qdrant probes, editable connection targets, and labelled parameter sliders. Each row toggles independently.",
+    "detail": "docs/DETAIL.md"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Memory service switch",
+    "description": "A floating capsule in the bottom-right corner showing whether the local Python memory service (127.0.0.1:41012) is connected. Open it to see address, latency, PID and recent log, and to start or stop the service."
+  }
+}

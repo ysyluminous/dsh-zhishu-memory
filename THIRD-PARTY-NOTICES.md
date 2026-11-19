@@ -1,4 +1,4 @@
-﻿# THIRD-PARTY-NOTICES
+# THIRD-PARTY-NOTICES
 
 本仓库 `ported/` 下的代码**不是本项目原创**，来源如下。
 
@@ -7,9 +7,9 @@
 | 项 | 值 |
 |---|---|
 | 仓库 | `https://github.com/EternalNight996/memory-eternal` |
-| 版本 | `0.49.11`（取自上游 `package.json` 的 `version`） |
+| 版本 | `0.49.11`（`ported/` 里复制的那一版，取自上游 `package.json` 的 `version`）；**已补 sha 基线**：`9e958bdbbdf381be6341a9fffbd3ebe76bd16b8e`（v0.49.12，2026-11-16T18:21:28Z），完整快照落盘 `D:\code\reference\memory-eternal-sha\` |
 | 许可 | **MIT License**，Copyright (c) 2026 EternalNight996（原文见 `LICENSE-memory-eternal`） |
-| 获取方式 | 通过镜像下载 zip 解压（`ghproxy.net`），**未取到 commit sha**，故版本只能按 `package.json` 记为 0.49.11，具体 commit 未核实 |
+| 获取方式 | `ported/` 通过镜像下载 zip 解压（`ghproxy.net`），此前未取到 commit sha，故基线只能按 `package.json` 记为 0.49.11；**2026-11-17 已用 GitHub API 补 sha 并重拉**，`ported/` 内文件未改动（仅补基线，不回写已复制的内容） |
 | 抄的方式 | `ported/NN-*/` 下为上游 `lib/` 的**原样复制**（不改写、不删注释）；每个目录附 `NOTES.md` 说明依赖与接入点 |
 
 ## 我们抄了什么（ROI 顺序）

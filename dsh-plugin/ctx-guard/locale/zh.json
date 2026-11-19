@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "上下文预算守卫",
+    "description": "按回合在 agent 开始干活前追加一条极短的自省提示（写 mem.doc / 压缩 / 开新会话），参数在 cordis.patch.yml 里可改：模式、间隔轮数、提示长度、日志路径。"
+  }
+}

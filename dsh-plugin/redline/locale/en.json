@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Redline guard",
+    "description": "Irreversible actions (pushing code, publishing, deploying, dropping tables, messaging outsiders) need approval at the tool layer: a matching call asks for approval, an unanswered call is refused, and every hit goes to an audit log."
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Context budget guard",
+    "description": "Adds one very short self-check line before the agent starts each turn (write to mem.doc, compact, or start a new session). Mode, interval, note length and log path are configurable in cordis.patch.yml."
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "name": "@asywr/dsh-zhishu-memory",
+  "version": "2.1.0",
+  "description": "Memory suite for DeepSeek Harness: recalls past decisions before each turn and writes the answer back after it, guards the context budget, asks before irreversible actions, and ships a workbench in the corner capsule (memory service / pg16 / Qdrant probes, setup, session log, backups, live parameters).",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ysyluminous/dsh-zhishu-memory.git",
+    "directory": "dsh-plugin"
+  },
+  "homepage": "https://github.com/ysyluminous/dsh-zhishu-memory/tree/main/dsh-plugin#readme",
+  "bugs": {
+    "url": "https://github.com/ysyluminous/dsh-zhishu-memory/issues"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "memory",
+    "pgvector",
+    "qdrant",
+    "cordis"
+  ],
+  "engines": {
+    "node": ">=22.15.0",
+    "dsh": ">=0.2.2-rc.1 <0.3.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "check": "node tools/pack-check.mjs",
+    "verify": "node tools/verify.mjs",
+    "report": "node tools/audit-report.mjs",
+    "prepublishOnly": "node tools/verify.mjs"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./ctx-guard": "./ctx-guard/index.js",
+    "./redline": "./redline/index.js",
+    "./mem-float": "./mem-float/index.js",
+    "./ctx-guard/locale/*.json": "./ctx-guard/locale/*.json",
+    "./redline/locale/*.json": "./redline/locale/*.json",
+    "./mem-float/locale/*.json": "./mem-float/locale/*.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib",
+    "tools",
+    "ctx-guard",
+    "redline",
+    "mem-float",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
+    }
+  }
+}

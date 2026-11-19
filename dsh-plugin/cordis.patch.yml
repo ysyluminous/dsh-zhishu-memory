@@ -1,0 +1,42 @@
+# 智枢记忆套件（@asywr/dsh-zhishu-memory）
+#
+# 一个包、四个 loader 行，四行各自独立启停；卸载/禁用不需要拆包。
+#
+# 2026-11-18 公开发布改造：这里**不再有任何本机绝对路径**。原来 context-guard 的
+# logPath、mem-float 的 serviceDir / launcher / python 都写死在某一台 Windows 上，
+# 别人装上去四行直接红。现在这些全部落到 `~/.dsh/zhishu-memory/settings.json`
+# 或代码里的 `homedir()` 默认值，工作台的配置页可改。
+- insert:
+    # 1) 记忆桥：开工前 gate 查记忆，收工后写回（含上下文编排，MEM_CTX_SWAP=1 才真替换）
+    - id: zhishu-memory
+      name: '@asywr/dsh-zhishu-memory'
+      config:
+        baseUrl: 'http://127.0.0.1:41012'
+        limit: 3
+
+    # 2) 上下文预算守卫：每轮开工前追加一条极短自省提示，不裁剪历史
+    #    noteEveryTurns 是「出厂值」，面板改的会覆盖它（见 lib/settings.js）。
+    #    2026-11-18：从 1 改回 8。1 是每轮都插，既吵又每轮多走一步；
+    #    而且旧代码把纯字符串塞进收件箱，是「开了插件就发不出消息」的真因（已修）。
+    - id: ctx-guard
+      name: '@asywr/dsh-zhishu-memory/ctx-guard'
+      config:
+        enabled: true
+        mode: smart
+        noteEveryTurns: 8
+        noteMaxChars: 220
+
+    # 3) 红线守卫：不可逆动作在工具层先批红，命中即写审计
+    - id: redline-guard
+      name: '@asywr/dsh-zhishu-memory/redline'
+      config: {}
+
+    # 4) 记忆服务悬浮开关 + 工作台：宿主侧控制口 41033 + 页面右下角胶囊
+    #    serviceDir / python / launcher 留空即按 homedir() 推导；要自定义就在
+    #    工作台「配置」里改，或在这里显式写。
+    - id: mem-float
+      name: '@asywr/dsh-zhishu-memory/mem-float'
+      config:
+        port: 41033
+        serviceUrl: 'http://127.0.0.1:41012'
+        servicePort: 41012
